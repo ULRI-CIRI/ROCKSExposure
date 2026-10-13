@@ -1,0 +1,3004 @@
+---
+title: "Analysis of Exposure Data for the ROCKS Chemical Collection"
+output:
+  html_document:
+    self_contained: true
+---
+
+This code includes analysis of chemical, use, emission, media occurrence, and intake data, and generation of figures supporting the manuscript: Isaacs, KK, Wambaugh JF, Charest N, Sinclair G, Shapiro AJ, Whitehead H, Boatman A, Ferland TM, Wall JT, Wilson M, Sams RL, Edwards S, Thomas RS, and Paul Friedman K. Characterizing Exposure Pathways for a Global Collection of Chemicals. Submitted to Environmental Science and Technology.
+
+Code: Kristin Isaacs, 10/2026
+
+Setup
+```{r}
+source("ROCKSsetup.R")
+
+
+preview_png <- function(
+  png_file,
+  scale = 0.25,
+  suffix = "_preview"
+) {
+
+  stopifnot(file.exists(png_file))
+
+  info <- png::readPNG(png_file, info = TRUE)
+  dims <- attr(info, "dim")
+
+  new_width  <- max(1, round(dims[2] * scale))
+  new_height <- max(1, round(dims[1] * scale))
+
+  # Unique preview filename based on original filename
+  base <- tools::file_path_sans_ext(basename(png_file))
+
+  preview_file <- file.path(
+    tempdir(),
+    paste0(base, suffix, ".png")
+  )
+
+  magick::image_read(png_file) |>
+    magick::image_resize(
+      paste0(new_width, "x", new_height)
+    ) |>
+    magick::image_write(preview_file)
+
+  preview_file
+}
+
+#Functions for estimating density
+
+#------------------------------------------------------------
+# Helper: interpolate KDE density back to original points
+#------------------------------------------------------------
+
+interp_kde2d <- function(x0, y0, kde) {
+  
+  gx <- kde$x
+  gy <- kde$y
+  gz <- kde$z
+  
+  out <- rep(NA_real_, length(x0))
+  
+  inside <- x0 >= min(gx) &
+    x0 <= max(gx) &
+    y0 >= min(gy) &
+    y0 <= max(gy) &
+    is.finite(x0) &
+    is.finite(y0)
+  
+  x0i <- x0[inside]
+  y0i <- y0[inside]
+  
+  ix <- findInterval(x0i, gx, all.inside = TRUE)
+  iy <- findInterval(y0i, gy, all.inside = TRUE)
+  
+  ix[ix == length(gx)] <- length(gx) - 1
+  iy[iy == length(gy)] <- length(gy) - 1
+  
+  x1 <- gx[ix]
+  x2 <- gx[ix + 1]
+  y1 <- gy[iy]
+  y2 <- gy[iy + 1]
+  
+  z11 <- gz[cbind(ix, iy)]
+  z21 <- gz[cbind(ix + 1, iy)]
+  z12 <- gz[cbind(ix, iy + 1)]
+  z22 <- gz[cbind(ix + 1, iy + 1)]
+  
+  wx <- (x0i - x1) / (x2 - x1)
+  wy <- (y0i - y1) / (y2 - y1)
+  
+  zi <- (1 - wx) * (1 - wy) * z11 +
+    wx * (1 - wy) * z21 +
+    (1 - wx) * wy * z12 +
+    wx * wy * z22
+  
+  out[inside] <- zi
+  
+  out
+}
+
+estimate_point_density <- function(
+    df,
+    flag_col,
+    n = 300,
+    xvar = "x",
+    yvar = "y"
+) {
+
+  if (!all(c(xvar, yvar, flag_col) %in% names(df))) {
+    stop("df must contain columns x, y, and the flag_col column.")
+  }
+
+  df$x <- df[[xvar]]
+  df$y <- df[[yvar]]
+    
+  df_flagged <- df %>%
+    dplyr::filter(.data[[flag_col]] == 1) %>%
+    dplyr::filter(is.finite(x), is.finite(y))
+  
+  if (nrow(df_flagged) < 2) {
+    stop("Need at least 2 finite x/y points where flag_col == 1.")
+  }
+  
+kde <- MASS::kde2d(
+x = df_flagged$x,
+y = df_flagged$y,
+n = n
+)
+  
+  density_grid <- expand.grid(
+    x = kde$x,
+    y = kde$y
+  )
+  
+  density_grid$density <- as.vector(kde$z)
+  
+  point_density <- df %>%
+    dplyr::mutate(
+      density = interp_kde2d(x, y, kde)
+    )
+  
+  list(
+    point_density = point_density[, c("x", "y", "density",flag_col)],
+    density_grid = density_grid,
+    kde = kde,
+    flag_col = flag_col
+  )
+}
+
+estimate_density_contours <- function(
+    density_result,
+    density_quantiles = c(0.50, 0.75, 0.90)
+) {
+  
+  if (any(!is.finite(density_quantiles)) ||
+      any(density_quantiles < 0 | density_quantiles > 1)) {
+    stop("density_quantiles must be numeric values between 0 and 1.")
+  }
+  
+  density_quantiles <- sort(unique(density_quantiles))
+  
+  point_density <- density_result$point_density
+  kde <- density_result$kde
+  flag_col <- density_result$flag_col
+  
+  density_thresholds <- stats::quantile(
+    point_density$density[point_density[[flag_col]] == 1],
+    probs = density_quantiles,
+    na.rm = TRUE,
+    names = FALSE
+  )
+  
+  threshold_df <- data.frame(
+    density_quantile = density_quantiles,
+    density_threshold = density_thresholds,
+    density_quantile_label = paste0(round(100 * density_quantiles), "th percentile")
+  )
+  
+  contour_df <- do.call(
+    rbind,
+    lapply(seq_along(density_quantiles), function(i) {
+      
+      qi <- density_quantiles[i]
+      ti <- density_thresholds[i]
+      qlab <- paste0(round(100 * qi), "th percentile")
+      
+      these_contours <- grDevices::contourLines(
+        x = kde$x,
+        y = kde$y,
+        z = kde$z,
+        levels = ti
+      )
+      
+      if (length(these_contours) == 0) {
+        return(NULL)
+      }
+      
+      do.call(
+        rbind,
+        lapply(seq_along(these_contours), function(j) {
+          data.frame(
+            x = these_contours[[j]]$x,
+            y = these_contours[[j]]$y,
+            density_quantile = qi,
+            density_threshold = ti,
+            density_quantile_label = qlab,
+            contour_piece = j,
+            contour_id = paste0("q", round(100 * qi), "_piece", j)
+          )
+        })
+      )
+    })
+  )
+  
+  if (is.null(contour_df)) {
+    contour_df <- data.frame(
+      x = numeric(),
+      y = numeric(),
+      density_quantile = numeric(),
+      density_threshold = numeric(),
+      density_quantile_label = character(),
+      contour_piece = integer(),
+      contour_id = character()
+    )
+  }
+  
+  list(
+    contours = contour_df,
+    density_thresholds = threshold_df
+  )
+}
+
+
+estimate_coverage_contours <- function(
+    density_result,
+    coverages = c(0.50, 0.75, 0.90)
+) {
+
+  point_density <- density_result$point_density
+  kde <- density_result$kde
+  flag_col <- density_result$flag_col
+
+  if (!flag_col %in% names(point_density)) {
+    stop("flag column not found in point_density")
+  }
+
+  flagged_density <- point_density$density[
+    point_density[[flag_col]] == 1 &
+      is.finite(point_density$density)
+  ]
+
+  if (length(flagged_density) == 0) {
+    stop("No finite densities found for flagged points")
+  }
+
+  # density threshold that leaves X% of points inside
+  density_thresholds <- quantile(
+    flagged_density,
+    probs = 1 - coverages,
+    na.rm = TRUE,
+    names = FALSE
+  )
+
+  threshold_df <- data.frame(
+    coverage = coverages,
+    density_threshold = density_thresholds
+  )
+
+  contour_df <- do.call(
+    rbind,
+    lapply(seq_along(coverages), function(i) {
+
+      cov <- coverages[i]
+      thr <- density_thresholds[i]
+
+      cl <- grDevices::contourLines(
+        x = kde$x,
+        y = kde$y,
+        z = kde$z,
+        levels = thr
+      )
+
+      if (length(cl) == 0) {
+        return(NULL)
+      }
+
+      do.call(
+        rbind,
+        lapply(seq_along(cl), function(j) {
+
+          data.frame(
+            x = cl[[j]]$x,
+            y = cl[[j]]$y,
+            coverage = cov,
+            density_threshold = thr,
+            contour_piece = j,
+            contour_id = paste0("cov_", cov, "_", j)
+          )
+
+        })
+      )
+    })
+  )
+
+  list(
+    contours = contour_df,
+    thresholds = threshold_df
+  )
+}
+
+
+
+#load data
+load("Data/fingerprints.RData")
+load("Data/inventory_all_descriptors2.RData")
+
+inventory_all_descriptors2$most_common_function_category<-capitalize_first(inventory_all_descriptors2$most_common_function_category)
+inventory_all_descriptors2$kingdom[which(inventory_all_descriptors2$kingdom=="UVCB")]<-"Unstructurable"
+
+#load the most recent rocks_sector_table.RData file
+#find the most recent file in the directory
+files<-list.files("Data/categories", pattern = "rocks_sector_table.*\\.RData$", full.names = TRUE)
+file <- files[order(file.info(files)$mtime, decreasing = TRUE)][1]  # Get the most recent 
+
+load(file)
+
+rocks_sector_table<-select(rocks_sector_table, -c("sector_class"))
+
+
+#sector colors for all plots
+ind_color<-"#122C49"
+consumer_color<-"#0A32FF"
+multiple_color<-"#00A451"
+unknown_color<-"#5B0428"
+pharma_color<-"#CA0123"
+ag_color<-"#00CAFB"
+food_color<-"#FF9D55"
+
+#type colors for all plots
+tradcolor = "#123A28"
+namcolor    = "#00689C"
+
+#Kingdom colors
+inorgcolor<-"#58595B"
+orgcolor<-"#00948F"
+unstructcolor<-"#E5DDCA"
+strucunknown<-"#BCBEC0"
+
+bloodexcolor<-"#98443D"
+
+```
+
+Sector and Sector Class Densities
+
+```{r}
+
+#create Density Maps for each sector
+tmp<-left_join(inventory_all_descriptors2, fingerprints, by=c("cichem_id"="cichem"))
+tmp<-left_join(tmp, rocks_sector_table, by=c("cichem_id"="cichem_id"))
+sector_densities<-tmp[,c("densmap_1","densmap_2","sector_class","consumer","food","industrial","agricultural","pharmaceutical")]
+sector_densities$pharma_only <- ifelse(sector_densities$sector_class == "Pharmaceutical Only", 1, 0)
+sector_densities$industrial_only <- ifelse(sector_densities$sector_class == "Industrial Only", 1, 0)
+sector_densities$unknown <- ifelse(sector_densities$sector_class == "Unknown", 1, 0)
+sector_densities$food_only <- ifelse(sector_densities$sector_class == "Food Only", 1, 0)
+sector_densities$multiple <- ifelse(sector_densities$sector_class == "Multiple Inventories", 1, 0)
+sector_densities$ag_only <- ifelse(sector_densities$sector_class == "Agricultural Only", 1, 0)
+sector_densities$consumer_only <- ifelse(sector_densities$sector_class == "Consumer Only", 1, 0)
+
+
+#loop over sector classes, estimate densities, and store as named list
+flag_cols <- c(
+  "pharma_only",
+  "industrial_only",
+  "unknown",
+  "food_only",
+  "multiple",
+  "ag_only",
+  "consumer_only",
+  "consumer",
+  "food",
+  "pharmaceutical",
+  "industrial",
+  "agricultural"
+)
+
+for (flag_col in flag_cols) {
+  density_result <- estimate_point_density(
+    df = sector_densities,
+    flag_col = flag_col,
+    xvar = "densmap_1",
+    yvar = "densmap_2"
+  )
+  
+  assign(paste0("dens_", gsub(" ", "_", tolower(flag_col))), density_result)
+}
+```
+
+Sector Plot: Figure S1
+
+```{r}
+#============================================================================================================================================
+do_sector_plot = function() {
+
+k<-data.frame(cbind(as.logical(rocks_sector_table$consumer),as.logical(rocks_sector_table$food),as.logical(rocks_sector_table$industrial),as.logical(rocks_sector_table$agricultural),as.logical(rocks_sector_table$pharmaceutical)))
+colnames(k)<-c("Consumer","Food","Industrial","Agricultural","Pharmaceutical")
+#upset(k, intersect=c("Consumer","Food","Industrial","Agricultural","Pharmaceutical"))
+
+sum<-rowSums(k)
+
+k$Unknown<-FALSE
+k$Unknown[which(sum==0)]<-TRUE
+
+p <- upset(
+ # k[sum > 0, ],
+  k,
+  intersect = c("Consumer", "Food", "Industrial", "Agricultural", "Pharmaceutical", "Unknown"),
+  max_degree = 3,
+  min_size = 200,
+  sort_intersections_by = "cardinality",
+  width_ratio = 0.3,
+  
+  base_annotations = list(
+    "Intersection size" = intersection_size(
+      counts = TRUE,
+      bar_number_threshold = Inf,   # <- prevents labels being moved inside bars
+      text = list(colour = "black",
+                  size=3
+      ),
+      mapping = aes(fill = "All")
+    ) +
+      scale_fill_manual(values = c("All" = ULcolors[4]), guide = "none") +
+      ylab("Intersection size")+labs(title = "Overlap Across Sectors") +
+      theme(axis.title.y = element_text(size = 14,vjust=-10))
+  ),
+  
+  set_sizes = upset_set_size(
+    mapping = aes(fill = "All")
+  ) +
+    scale_fill_manual(values = c("All" = ULcolors[3]), guide = "none") +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank()
+    ),
+  matrix = intersection_matrix() +
+    labs(x = NULL, y = NULL) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank()
+    )
+) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+return(p)
+}
+
+p<-do_sector_plot()
+#write the plot
+
+filename<-"Output/sector_plot.png"
+ggsave(filename, plot = p, width = 9, height =6, dpi = 300)
+
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+
+```
+
+INVENTORY PLOT: Figure 1
+
+```{r}
+#| fig-width: 5
+
+do_inventory_plot = function() {
+#Generate the Inventory Plot
+
+  
+#Decide which categories to keep
+j<-data.frame(table(inventory_all_descriptors2$most_common_function_category))
+
+
+base<-inventory_all_descriptors2
+keepfunctions<-c("Fragrance","Flavouring and nutrient","Softener and conditioner","Dye","Biocide","Surfactant (surface active agent)","Solvent","Emulsifier","Pharmaceutical","Pigment","Unknown")
+
+base$most_common_function_category<-capitalize_first(base$most_common_function_category)
+
+base$most_common_function_category[which(is.na(base$most_common_function_category))]<-"Unknown"
+base$most_common_function_category[which(base$most_common_function_category=="NANA")]<-"Unknown"
+
+base$most_common_function_category[which(!base$most_common_function_category %in% keepfunctions)]<-"Other"
+
+j<-data.frame(table(base$superclass))
+keepclasses<-c("Benzenoids","Organoheterocyclic compounds","Organic acids and derivatives","Lipids and lipid-like molecules","Organic oxygen compounds","Mixed metal/non-metal compounds","Organic nitrogen compounds","Phenylpropanoids and polyketides","Organohalogen compounds","Organometallic compounds","UVCB", "unknown")
+base$superclass[which(!base$superclass %in% keepclasses)]<-"Other"
+
+#  Long format
+# ----------------------------
+long_dt <- data.table::melt(
+  data.table(base),
+  id.vars = "inventory_type",
+  measure.vars = c("most_common_function_category", "sector_class", "kingdom", "superclass"),
+  variable.name = "category_type",
+  value.name = "category_value"
+)
+
+#remove things we don't want to plot
+long_dt<-long_dt[which(!(category_value=="Unknown" & category_type %in% c("most_common_function_category"))),]
+long_dt<-long_dt[which(!(category_value=="UVCB" & category_type %in% c("superclass"))),]
+
+
+# Explicit Missing
+invisible({
+  long_dt[is.na(category_value), category_value := "Missing"]
+  long_dt[is.na(inventory_type), inventory_type := "Missing"]
+})
+
+# ----------------------------
+# 4. Plot function (fully fixed)
+# ----------------------------
+make_plot <- function(varname,
+                      base_colors,
+                      title = NULL,
+                      show_y = TRUE,
+                      show_x = TRUE, type="inventory") {
+  
+  sub_dt <- copy(long_dt[category_type == varname])
+  
+  # Order categories globally (Missing first ⇒ plotted on top)
+  freq <- sub_dt[, .N, by = category_value][order(N)]
+  if ("Missing" %in% freq$category_value) {
+    levels_order <- c("Missing", setdiff(freq$category_value, "Missing"))
+  } else {
+    levels_order <- freq$category_value
+  }
+  sub_dt[, category_value := factor(category_value, levels = levels_order)]
+  
+  # Build safe color vector
+  cats <- levels(sub_dt$category_value)
+  col_vec <- rep(base_colors, length.out = length(cats))
+  names(col_vec) <- cats
+  col_vec["Missing"] <- "#B0B0B0"
+  
+  p <- ggplot(sub_dt, aes(x = inventory_type, fill = category_value)) +
+    geom_bar(position = "fill") +
+    scale_fill_manual(values = col_vec, drop = FALSE) +
+    labs(
+      title = ifelse(is.null(title), varname, title),
+      x = if (show_x) "Sector Category" else NULL,
+      y = if (show_y) "Proportion" else NULL,
+      fill = varname
+    ) +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      plot.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.text = element_text(size = 8),
+      legend.key.size = unit(0.35, "cm")
+    )
+  
+  # Remove axes if requested
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  return(p)
+}
+
+#By Sector
+
+tmp <- base
+tmp$inventory_type <- tmp$sector_class
+
+long_dt <- data.table::melt(
+  data.table(tmp),
+  id.vars = "inventory_type",
+  measure.vars = c("most_common_function_category", "kingdom", "superclass"),
+  variable.name = "category_type",
+  value.name = "category_value"
+)
+
+# remove things we don't want to plot
+long_dt <- long_dt[
+  !(category_value == "Unknown" & category_type == "most_common_function_category")
+]
+long_dt <- long_dt[
+  !(category_value == "UVCB" & category_type == "superclass")
+]
+
+# Explicit Missing
+invisible({
+  long_dt[is.na(category_value), category_value := "Missing"]
+  long_dt[is.na(inventory_type), inventory_type := "Missing"]
+})
+
+# force common x order across all panels
+sector_order <- unique(long_dt$inventory_type)
+sector_order<-  c("Multiple Inventories","Industrial Only","Consumer Only","Pharmaceutical Only","Agricultural Only","Food Only","Unknown")
+long_dt[, inventory_type := factor(inventory_type, levels = sector_order)]
+
+# counts per sector_class for aligned bar panel
+count_dt <- as.data.table(base)
+count_dt[is.na(sector_class), sector_class := "Missing"]
+count_dt <- count_dt[, .(n_chemicals = .N), by = sector_class]
+count_dt[, sector_class := factor(sector_class, levels = sector_order)]
+
+# horizontal panel with bars aligned to same x positions
+
+library(scales)
+
+p2 <- ggplot(count_dt, aes(x = sector_class, y = n_chemicals)) +
+  geom_col(fill = "grey40", width = 0.8) +
+  scale_x_discrete(limits = sector_order, drop = FALSE) +
+  scale_y_log10(labels = label_comma()) +
+  labs(
+    x = NULL,
+    y = "Number of chemicals",
+    title = "Number of Chemicals"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_blank()
+  )
+kingdomcols<-c(inorgcolor,strucunknown,unstructcolor,orgcolor)
+p1 <- make_plot("most_common_function_category", ULcolors, show_x = TRUE, title = "Most Common Function")
+p3 <- make_plot("kingdom", kingdomcols, show_x = FALSE, title = "Structural Kingdom")
+p4 <- make_plot("superclass", ULcolors[9:19], show_x = FALSE, title = "Structural Superclass")
+
+final_plot <-  p2/p3 / p4 /  p1 
+
+return(final_plot)
+}
+
+
+filename<-"Output/inventory_panels_fig1.png"
+final_plot<-do_inventory_plot()
+ggsave(
+  filename = filename,
+  plot = final_plot,
+  width = 9,
+  height = 9,
+  dpi = 300
+)
+
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+
+
+```
+Supplemental Table 3: Inventory counts
+```{r}
+
+files<-list.files("Data/categories", pattern = "rocks_sector_table.*\\.RData$", full.names = TRUE)
+file <- files[order(file.info(files)$mtime, decreasing = TRUE)][1]  # Get the most recent 
+
+load(file)
+
+j1<-data.frame(table(rocks_sector_table$sector_class))
+j1$Variable<-"sector class"
+j1$Value<-j1$Var1
+j1$Count<-j1$Freq
+j1<-j1[,c("Variable","Value","Count")]
+j1<-j1[order(-j1$Count),]
+j1$Value[which(j1$Value=="NANA")]<-"None"
+
+k1<-c("sector","industrial",length(which(rocks_sector_table$industrial==1)))
+k2<-c("sector","food",length(which(rocks_sector_table$food==1)))
+k3<-c("sector","consumer",length(which(rocks_sector_table$consumer==1)))
+k4<-c("sector","pharmaceutical",length(which(rocks_sector_table$pharmaceutical==1)))
+k5<-c("sector","agricultural",length(which(rocks_sector_table$agricultural==1)))
+k6<-c("monitoring","biomonitoring",length(which(rocks_sector_table$biomonitoring==1)))
+k7<-c("monitoring","environmental",length(which(rocks_sector_table$env_monitoring==1)))
+
+k<-data.frame(rbind(k1,k3,k2,k5,k4,k6,k7))
+colnames(k)<-c("Variable","Value","Count")
+k$Count<-as.numeric(as.character(k$Count))
+
+#function table
+j2<-data.frame(table(inventory_all_descriptors2$most_common_function_category))
+j2$Variable<-"most common function"
+j2$Value<-j2$Var1
+j2$Count<-j2$Freq
+j2<-j2[,c("Variable","Value","Count")]
+j2<-j2[order(-j2$Count),]
+j2$Value<-as.character(j2$Value)
+j2$Value[which(j2$Value=="NANA")]<-"None Available"
+
+#region table
+j3<-data.frame(table(inventory_all_descriptors2$region_class))
+j3$Variable<-"region class"
+j3$Value<-j3$Var1
+j3$Count<-j3$Freq
+j3<-j3[,c("Variable","Value","Count")]
+j3<-j3[order(-j3$Count),]
+j3$Value<-as.character(j3$Value)
+
+
+j4<-data.frame(table(inventory_all_descriptors2$superclass))
+j4$Variable<-"superclass"
+j4$Value<-j4$Var1
+j4$Count<-j4$Freq
+j4<-j4[,c("Variable","Value","Count")]
+j4<-j4[order(-j4$Count),]
+j4$Value<-as.character(j4$Value)
+j4$Value[which(j4$Value=="UVCB")]<-"Unstructurable"
+j4$Value[which(j4$Value=="")]<-"No Classyfire Available"
+
+
+j<-bind_rows(j1,k,j2,j3,j4)
+print(j)
+
+write.csv(j,"Output/inventory_counts_SI_TableS3.csv",row.names=FALSE)
+
+```
+
+Sector Mapping: Figure 2
+
+```{r}
+
+do_sector_mapping<- function() {
+j<-fingerprints
+
+#merge
+tmp<-left_join(inventory_all_descriptors2, j, by=c("cichem_id"="cichem"))
+
+tmp<-tmp[which(!is.na(tmp$densmap_1)),] #structurable
+
+#make a ggplot scatter of tnse1 vs tsne2 colored by sector class
+set.seed(125)
+colors<-sample(ULcolors, length(unique(tmp$sector_class)), replace = FALSE)
+library(ggplot2)
+#order the levels of sector
+
+tmp$sector_class[tmp$sector_class=="Multiple Inventories"]<-"Multiple Sectors" 
+tmp$sector_class <- factor(tmp$sector_class, levels = c("Industrial Only","Consumer Only","Multiple Sectors","Unknown","Pharmaceutical Only","Agricultural Only" ,"Food Only" ))
+
+colors<-c("Industrial Only"= ind_color,"Consumer Only"= consumer_color,"Multiple Sectors"= multiple_color,"Unknown"= unknown_color,"Pharmaceutical Only"=pharma_color,"Agricultural Only" = ag_color,  
+"Food Only" = food_color)
+
+# count points per sector
+group_sizes <- table(tmp$sector_class)
+
+# add size to data
+tmp$group_size <- group_sizes[as.character(tmp$sector_class)]
+
+# sort largest groups first
+tmp <- tmp[order(-tmp$group_size), ]
+
+sectordensity <- ggplot(
+  tmp,
+  aes(x = densmap_1, y = densmap_2, color = sector_class)) +
+  geom_point(alpha = 0.1, size=0.6, shape=16) +
+  theme_minimal() +
+  labs(title = "Sector Class") +xlab("DensMap Dimension 1")+ ylab("DensMap Dimension 2")+
+  scale_color_manual(values = colors) +
+  theme(legend.title = element_blank())+ guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+
+quantiles = c(0.50, 0.75, 0.90)
+quantiles = c(0.70)
+
+
+flag_cols <- c( "pharma_only","industrial_only","unknown","food_only","multiple","ag_only","consumer_only","pharmaceutical","agricultural","consumer","food","industrial")
+# for (name in flag_cols) {
+#   densname<-paste0("dens_", gsub(" ", "_", tolower(name)))
+#   density_result <- get(densname)
+#   cont <- estimate_density_contours(
+#     density_result = density_result,
+#     density_quantiles = quantiles
+#   )
+#   assign(paste0("cont_", name), cont)
+# }
+
+
+for (name in flag_cols) {
+  densname<-paste0("dens_", gsub(" ", "_", tolower(name)))
+  density_result <- get(densname)
+  cont <- estimate_coverage_contours(
+    density_result = density_result,
+    coverages = quantiles
+  )
+  assign(paste0("cont_", name), cont)
+}
+
+
+linew<-0.8
+#explore density contours for each sector class
+sectordensity1<-sectordensity +   ylim(-5,20)+xlim(-10,20)+
+  geom_path(data = cont_pharma_only$contours,aes(x = x,y = y,group = contour_id),color = pharma_color,linewidth = linew,inherit.aes = FALSE)+
+  geom_path(data = cont_industrial_only$contours,aes(x = x,y = y,group = contour_id),color = ind_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_food_only$contours,aes(x = x,y = y,group = contour_id),color = food_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_ag_only$contours,aes(x = x,y = y,group = contour_id),color = ag_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_consumer_only$contours,aes(x = x,y = y,group = contour_id),color = consumer_color,linewidth =1,inherit.aes=FALSE)+
+  geom_path(data = cont_unknown$contours,aes(x = x,y = y,group = contour_id),color = unknown_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_multiple$contours,aes(x = x,y = y,group = contour_id),color = multiple_color,linewidth =linew,inherit.aes=FALSE)
+
+
+sectordensity2<-sectordensity +  ylim(-5,20)+xlim(-10,20)+
+  geom_path(data = cont_pharmaceutical$contours,aes(x = x,y = y,group = contour_id),color = pharma_color,linewidth = linew,inherit.aes = FALSE)+
+  geom_path(data = cont_industrial$contours,aes(x = x,y = y,group = contour_id),color = ind_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_food$contours,aes(x = x,y = y,group = contour_id),color = food_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_agricultural$contours,aes(x = x,y = y,group = contour_id),color = ag_color,linewidth =linew,inherit.aes=FALSE)+
+  geom_path(data = cont_consumer$contours,aes(x = x,y = y,group = contour_id),color = consumer_color,linewidth =1,inherit.aes=FALSE)+
+  geom_path(data = cont_unknown$contours,aes(x = x,y = y,group = contour_id),color = unknown_color,linewidth =linew,inherit.aes=FALSE)
+
+
+  #a little transparent
+return(  list(
+    plot1 = sectordensity1,
+    plot2 = sectordensity2
+  ))
+}
+k<-do_sector_mapping()
+filename<-"Output/sector_mapping1.png"
+ggsave(
+  filename = filename,
+  plot = k[[1]],
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+filename<-"Output/sector_mapping2.png"
+ggsave(
+  filename = filename,
+  plot = k[[2]],
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+```
+
+Generate Table of Use and Emission by Structurable vs. Unstructurable: SI Table 4.
+
+```{r}
+
+#load latest version of inventory_use data_DATE
+
+file<-list.files("Data", pattern = "inventory_use_data.*\\.RData$", full.names = TRUE)
+file <- file[order(file.info(file)$mtime, decreasing = TRUE)][1]  # Get the most recent file
+load(file)
+
+inventory_use$kingdom[which(inventory_use$kingdom=="UVCB")]<-"Unstructurable"
+tmp<-inventory_use[which(inventory_use$kingdom != c("Unknown")),]
+
+file<-list.files("Data", pattern = "inventory_emission_data.*\\.RData$", full.names = TRUE)
+file <- file[order(file.info(file)$mtime, decreasing = TRUE)][1]  # Get the most recent file
+load(file)
+
+usedata<-left_join(tmp, inventory_emission)
+
+j<-inventory_all_descriptors2
+
+empiricalusevars<-c("consumer_ciexpo","reported_function_ciexpo","inventory_product","inventory_industry","lp_ciexpo")
+
+rows<-j$cichem_id
+nrows<-length(rows)
+countwithempiricaluse<-length(which(rowSums(usedata[, empiricalusevars], na.rm = TRUE)>0))
+countwithpredicteduse<-length(which(usedata[, c("predicted_function_ciexpo")]==1))
+k0<-c("All Chemicals","Use",round(countwithempiricaluse/nrows,3),round(countwithpredicteduse/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Organic compounds")]
+nrows<-length(rows)
+countwithempiricaluse<-length(which(rowSums(usedata[usedata$cichem_id %in% rows, empiricalusevars], na.rm = TRUE)>0))
+countwithpredicteduse<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_function_ciexpo")]==1))
+k1<-c("Organic compounds","Use",round(countwithempiricaluse/nrows,3),round(countwithpredicteduse/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Inorganic compounds")]
+nrows<-length(rows)
+countwithempiricaluse<-length(which(rowSums(usedata[usedata$cichem_id %in% rows, empiricalusevars], na.rm = TRUE)>0))
+countwithpredicteduse<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_function_ciexpo")]==1))
+k2<-c("Inorganic compounds","Use",round(countwithempiricaluse/nrows,3),round(countwithpredicteduse/nrows,3))
+
+rows<-j$cichem_id[which(!j$kingdom %in% c("Unstructurable"))]
+nrows<-length(rows)
+countwithempiricaluse<-length(which(rowSums(usedata[usedata$cichem_id %in% rows, empiricalusevars], na.rm = TRUE)>0))
+countwithpredicteduse<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_function_ciexpo")]==1))
+k3<-c("Structurable chemicals","Use",round(countwithempiricaluse/nrows,3),round(countwithpredicteduse/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Unstructurable")]
+nrows<-length(rows)
+countwithempiricaluse<-length(which(rowSums(usedata[usedata$cichem_id %in% rows, empiricalusevars], na.rm = TRUE)>0))
+countwithpredicteduse<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_function_ciexpo")]==1))
+k4<-c("Unstructurable chemicals","Use",round(countwithempiricaluse/nrows,3),round(0,3))
+
+#Emission
+
+empiricalemvars<-c("inventory_emission")
+
+rows<-j$cichem_id
+nrows<-length(rows)
+countwithempiricalemission<-length(which(usedata[usedata$cichem_id %in% rows, c("inventory_emission")]==1))
+countwithpredictedemission<-length(which(usedata[, c("predicted_emission")]==1))
+k5<-c("All Chemicals","Emission",round(countwithempiricalemission/nrows,3),round(countwithpredictedemission/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Organic compounds")]
+nrows<-length(rows)
+countwithempiricalemission<-length(which(usedata[usedata$cichem_id %in% rows, c("inventory_emission")]==1))
+countwithpredictedemission<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_emission")]==1))
+k6<-c("Organic compounds","Emission",round(countwithempiricalemission/nrows,3),round(countwithpredictedemission/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Inorganic compounds")]
+nrows<-length(rows)
+countwithempiricalemission<-length(which(usedata[usedata$cichem_id %in% rows, c("inventory_emission")]==1))
+countwithpredictedemission<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_emission")]==1))
+k7<-c("Inorganic compounds","Emission",round(countwithempiricalemission/nrows,3),round(countwithpredictedemission/nrows,3))
+
+rows<-j$cichem_id[which(!j$kingdom %in% c("Unstructurable"))]
+nrows<-length(rows)
+countwithempiricalemission<-length(which(usedata[usedata$cichem_id %in% rows, c("inventory_emission")]==1))
+# countwithempiricalemission<-length(which(rowSums(usedata[usedata$cichem_id %in% rows, empiricalemvars], na.rm = TRUE)>0))
+countwithpredictedemission<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_emission")]==1))
+k8<-c("Structurable chemicals","Emission",round(countwithempiricalemission/nrows,3),round(countwithpredictedemission/nrows,3))
+
+rows<-j$cichem_id[which(j$kingdom=="Unstructurable")]
+nrows<-length(rows)
+countwithempiricalemission<-length(which(usedata[usedata$cichem_id %in% rows, c("inventory_emission")]==1))
+countwithpredictedemission<-length(which(usedata[usedata$cichem_id %in% rows, c("predicted_emission")]==1))
+k9<-c("Unstructurable chemicals","Emission",round(countwithempiricalemission/nrows,3),round(countwithpredictedemission/nrows,3))
+
+k<-rbind(k0,k1,k2,k3,k4,k5,k6,k7,k8,k9)
+colnames(k)<-c("Group","Domain","Fraction with Empirical Data","Fraction with Predicted Data")
+print(k)
+
+write.csv(k,"Output/use_emission_coverage.csv",row.names = F)
+
+
+```
+
+FUNCTION ANALYSES
+
+```{r}
+#how many inventory chemicals had functions
+
+load("data/inventory_all_descriptors2.Rdata")
+
+num_had_func<-length(which(inventory_all_descriptors2$most_common_function_category!="NANA" & inventory_all_descriptors2$most_common_function_category!=""))
+
+print(paste0("Number of chemicals with reported functional use: ",num_had_func," ",num_had_func/length(inventory_all_descriptors2$cichem_id)))
+
+#look at reported functional uses of REACH chemicals that were reported as "intermediate only"
+load("Data/reach/reach_data_final.Rdata")
+
+#get predicted_functional_use
+load("Data/function_use.Rdata")
+
+#highly predicted function is >0.8
+function_use_high<-function_use[which(function_use$probability>0.8),]
+
+intermediates<-unique(reach_data_final[which(reach_data_final$Total.tonnage.Band=="Intermediate use only"),c("cichem_id","Total.tonnage.Band")])  
+
+
+industrial_only<-unique(inventory_all_descriptors2[which(inventory_all_descriptors2$sector_class=="Industrial Only"),c("cichem_id","sector_class")])
+
+#how intermediates from REACH had predicted and reported functional uses
+intermediates1<-left_join(intermediates,function_use_high,by=c("cichem_id"="cichem_id"))
+
+print(paste0("Number of Reach Intermediates in Industrial Only collection chemicals= ",length(which(intermediates1$cichem_id %in% industrial_only$cichem_id))))
+
+intermediates_with_qsur<-length(unique(intermediates1$cichem_id[which(!is.na(intermediates1$id))]))
+perc_has_qsur<-intermediates_with_qsur/length(unique(intermediates1$cichem_id))
+
+intermediates2<-left_join(intermediates, inventory_all_descriptors2)
+perc_has_reported<-length(which(intermediates2$most_common_function_category!="NANA" & intermediates2$most_common_function_category!=""))/length(intermediates2$cichem_id)
+
+paste0("Percent of REACH Intermediates without Predicted Functional Use >0.8= ",100-round(perc_has_qsur*100,2),"%")
+paste0("Percent of REACH Intermediates without Reported Functional Use= ",100-round(perc_has_reported*100,2),"%")
+
+
+#how many industrial only chemicals had function
+numreported<-length(which(!is.na(inventory_all_descriptors2$most_common_function_category[which(inventory_all_descriptors2$sector_class=="Industrial Only")])))
+print(paste0("Number of Industrial Only Chemicals with Reported Functions= ",numreported," ",numreported/length(which(inventory_all_descriptors2$sector_class=="Industrial Only"))))
+
+
+withfuncpred<-length(which(inventory_all_descriptors2$cichem_id[which(inventory_all_descriptors2$sector_class=="Industrial Only")] %in% function_use$cichem_id))
+
+withhighpred<-length(which(inventory_all_descriptors2$cichem_id[which(inventory_all_descriptors2$sector_class=="Industrial Only")] %in% function_use_high$cichem_id))
+
+print(paste0("Number of Industrial Only Chemicals with Predicted Functions= ",withfuncpred," ",withfuncpred/length(which(inventory_all_descriptors2$sector_class=="Industrial Only"))))
+
+print(paste0("Number of Industrial Only Chemicals with Predicted Functions >0.8= ",withhighpred," ",withhighpred/length(which(inventory_all_descriptors2$sector_class=="Industrial Only"))))
+
+
+
+```
+
+USE - EMISSION LANDSCAPE PLOT: FIG 3
+
+```{r}
+
+do_uselandscape_plot = function() {
+  # Load necessary libraries
+  library(ComplexHeatmap)
+  library(grid)
+  library(circlize)
+  library(dplyr)
+  library(data.table)
+
+
+#==================================================
+# LOAD DATA
+#==================================================
+
+#load latest version of inventory_use data_DATE
+
+file<-list.files("Data", pattern = "inventory_use_data.*\\.RData$", full.names = TRUE)
+file <- file[order(file.info(file)$mtime, decreasing = TRUE)][1]  # Get the most recent file
+load(file)
+
+inventory_use$kingdom[which(inventory_use$kingdom=="UVCB")]<-"Unstructurable"
+tmp<-inventory_use[which(inventory_use$kingdom != c("Unknown")),]
+
+file<-list.files("Data", pattern = "inventory_emission_data.*\\.RData$", full.names = TRUE)
+file <- file[order(file.info(file)$mtime, decreasing = TRUE)][1]  # Get the most recent file
+load(file)
+
+usedata<-left_join(tmp, inventory_emission)
+
+usedata<-usedata[,c("inventory_production","inventory_emission","predicted_emission","inventory_industry","inventory_product","consumer_ciexpo","lp_ciexpo","predicted_function_ciexpo","reported_function_ciexpo")]
+
+
+
+#==================================================
+# PREP MATRICES
+#==================================================
+
+flag_mat <- as.matrix(usedata)
+storage.mode(flag_mat) <- "numeric"
+
+# grouping factor for all combinations
+grp <- interaction(
+  tmp$sector_class,
+  tmp$kingdom,
+  drop = TRUE,
+  lex.order = TRUE
+)
+
+# counts of 1s by group and variable
+count_mat <- rowsum(flag_mat, grp, na.rm = TRUE)
+count_mat <- as.matrix(count_mat)
+
+# counts across all chemicals for each original variable
+count_chems <- colSums(flag_mat, na.rm = TRUE)
+
+# number of chemicals in each group
+group_n <- as.vector(table(grp)[rownames(count_mat)])
+
+# proportion of 1s within each group
+prop_mat <- sweep(count_mat, 1, group_n, "/")
+prop_mat <- as.matrix(prop_mat)
+
+# split group labels back out
+group_vars <- do.call(
+  rbind,
+  strsplit(rownames(prop_mat), split = "\\.")
+) |>
+  as.data.frame(stringsAsFactors = FALSE)
+
+colnames(group_vars) <- c("sector_class", "kingdom")
+
+# clamp proportions to [0,1]
+fill_prop <- pmin(pmax(prop_mat, 0), 1)
+
+#==================================================
+# TOTAL CHEMICALS IN GROUP (ONES + ZEROS)
+#==================================================
+
+total_group_mat <- matrix(
+  group_n,
+  nrow = nrow(prop_mat),
+  ncol = ncol(prop_mat),
+  byrow = FALSE,
+  dimnames = dimnames(prop_mat)
+)
+
+#==================================================
+# FLIP / ROTATE FOR DISPLAY
+#==================================================
+
+# After transpose:
+# - original variables become rows
+# - original groups become columns
+prop_mat_t        <- t(prop_mat)
+fill_prop_t       <- t(fill_prop)
+count_mat_t       <- t(count_mat)
+total_group_mat_t <- t(total_group_mat)
+
+
+#==================================================
+# PRETTY ROW LABELS (INSERT HERE)
+#==================================================
+
+new_row_names <- rownames(prop_mat_t)
+
+
+# manual overrides (EDIT THESE) Order doesnt matter (matched belwo)
+pretty_row_labels <- c(
+  "inventory_product"     = "Product Category (Inventory)",
+  "inventory_industry"   = "Industrial Category (Inventory)",
+  "reported_function_ciexpo"         = "Function (CIExpo-Use)",
+  "lp_ciexpo" = "General Use (CIExpo-Use)",
+  "predicted_function_ciexpo" = "Predicted Function",
+  "consumer_ciexpo" = "Product Category (CIExpo-Use)",  
+  "inventory_production" = "Production/Import Volume (Inventory)",
+  "inventory_emission" = "Emission Volume (Inventory)",
+  "predicted_emission" = "Predicted Emission Volume"
+)
+
+idx <- new_row_names %in% names(pretty_row_labels)
+new_row_names[idx] <- pretty_row_labels[new_row_names[idx]]
+
+# apply back to ALL matrices used downstream
+rownames(prop_mat_t)        <- new_row_names
+rownames(fill_prop_t)       <- new_row_names
+rownames(count_mat_t)       <- new_row_names
+rownames(total_group_mat_t) <- new_row_names
+
+
+nr <- nrow(prop_mat_t)
+nc <- ncol(prop_mat_t)
+
+layout_mat <- matrix(
+  0,
+  nrow = nr,
+  ncol = nc,
+  dimnames = list(rownames(prop_mat_t), colnames(prop_mat_t))
+)
+
+##Define valid/invalid pies
+
+valid_mat <- matrix(
+  TRUE,
+  nrow = nrow(prop_mat_t),
+  ncol = ncol(prop_mat_t),
+  dimnames = dimnames(prop_mat_t)
+)
+
+# invalid combinations
+
+valid_mat[
+  "Product Category (CIExpo-Use)",
+  group_vars$sector_class == "Industrial Only"
+] <- FALSE
+
+valid_mat[
+  "Predicted Function",
+  group_vars$kingdom == "Unstructurable"
+] <- FALSE
+
+valid_mat[
+  "Product Category (Inventory)",
+  group_vars$sector_class == "Industrial Only"
+] <- FALSE
+
+
+valid_mat[
+  "Industrial Category (Inventory)",
+  group_vars$sector_class %in% c("Consumer Only", "Pharmaceutical Only", "Agricultural Only", "Food Only")
+] <- FALSE
+
+
+
+fill_prop_t[!valid_mat] <- NA
+
+#==================================================
+# FIXED PIE SIZE + BOTTOM ANNOTATION FOR BIN COUNTS
+#==================================================
+
+cell_w_mm <- 8
+cell_h_mm <- 8
+
+# Fixed pie radius as fraction of smaller cell dimension
+pie_r_factor <- 0.45
+
+# Chemical counts to display under each column/bin
+# This assumes counts are the same across rows within each column.
+# If not, see safety check below.
+bin_counts <- total_group_mat_t[1, ]
+
+# Optional safety check: make sure counts are column-level, not row-specific
+if (!all(apply(total_group_mat_t, 2, function(z) length(unique(na.omit(z))) <= 1))) {
+  warning(
+    "total_group_mat_t has different counts across rows within at least one column. ",
+    "Using first row for bottom annotation. Check whether this is intended."
+  )
+}
+
+# Format labels for bottom annotation
+bin_count_labels <- formatC(
+  bin_counts,
+  format = "d",
+  big.mark = ","
+)
+
+#==================================================
+# CATEGORY FOR PIE COLOR (ASSOCIATED WITH ROWS)
+#==================================================
+# Replace this placeholder with your real row -> category mapping.
+# Names must match rownames(prop_mat_t), i.e. the displayed row labels.
+
+
+#==================================================
+# CATEGORY FOR PIE COLOR (ASSOCIATED WITH ROWS)
+#==================================================
+
+row_category <- c(
+  "Product Category (Inventory)"    = "Traditional",
+  "Industrial Category (Inventory)" = "Traditional",
+  "Production/Import Volume (Inventory)" = "Traditional",
+  "Emission Volume (Inventory)" = "Traditional",
+  "Function (CIExpo-Use)"           = "NAM",
+  "General Use (CIExpo-Use)"        = "NAM",
+  "Predicted Function"              = "NAM",
+  "Product Category (CIExpo-Use)"   = "NAM",
+  "Predicted Emission Volume"       = "NAM"
+)
+
+# make sure order matches displayed rows
+row_category <- row_category[rownames(prop_mat_t)]
+
+# safety check
+if (any(is.na(row_category))) {
+  stop("Some row names in prop_mat_t are missing from row_category.")
+}
+
+row_category <- as.character(row_category)
+
+row_cat_levels <- unique(row_category)
+
+if (length(row_cat_levels) > length(ULcolors)) {
+  stop("Not enough colors in ULcolors for the number of row categories.")
+}
+
+# choose 2 colors explicitly 
+row_cat_cols <- c(
+  "Traditional" = tradcolor,
+  "NAM"    = namcolor
+)
+
+
+#==================================================
+# TOP ANNOTATION COLORS
+#==================================================
+
+make_named_palette <- function(values, palette) {
+  levs <- unique(as.character(values))
+  
+  if (length(levs) > length(palette)) {
+    stop("Not enough colors in palette for the number of categories.")
+  }
+  
+  setNames(palette[seq_along(levs)], levs)
+}
+
+sector_cols <- make_named_palette(group_vars$sector_class, ULcolors)
+kingdom_cols <- make_named_palette(group_vars$kingdom, ULcolors[c(19,17,7)])
+
+sector_cols<-c("Industrial Only"= ind_color,"Consumer Only"= consumer_color,"Multiple Inventories"= multiple_color,"Unknown"= unknown_color,"Pharmaceutical Only"=pharma_color,"Agricultural Only" = ag_color,  
+"Food Only" = food_color)
+
+bottom_ha <- HeatmapAnnotation(
+  Kingdom = group_vars$kingdom,
+  Sector = group_vars$sector_class,
+  col = list(
+    Sector = sector_cols,
+    Kingdom = kingdom_cols
+  ),
+  show_legend = c(
+    sector_class = FALSE,
+    kingdom = FALSE
+  ),
+  
+  show_annotation_name = TRUE,
+  annotation_name_side = "left",
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = 7),
+  simple_anno_size = unit(3, "mm"),
+  gap = unit(1, "mm")
+)
+
+
+right_ha <- rowAnnotation(
+  `Chemicals with Data` = anno_barplot(
+    log10(count_chems),
+    gp = gpar(fill = "grey40", col = NA),
+    border = FALSE,
+    width = unit(2, "cm"),
+    axis_param = list(
+      side = "top",
+      at = log10(c(100, 1000, 10000,100000)),
+      labels = c("100", "1000","10000","100000")
+    )
+  ),
+  show_annotation_name = TRUE,
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(
+    fontsize = 8,
+    fontface = "bold"
+  )
+)
+
+
+left_ha <- rowAnnotation(
+  pie_category = row_category,
+  col = list(pie_category = row_cat_cols),
+  show_annotation_name = TRUE,
+  annotation_name_rot = 90,
+  annotation_name_gp = gpar(fontsize = 7),
+  simple_anno_size = unit(3, "mm")
+)
+
+
+
+top_ha <- HeatmapAnnotation(
+
+  N = anno_text(
+    format(bin_counts, big.mark = ","),
+    location = 0.5,
+    just = "center",
+    rot = 0,
+    gp = gpar(fontsize = 6)
+  ),
+
+  `Chemicals in Group` = anno_barplot(
+    log10(bin_counts),
+    gp = gpar(fill = "grey40", col = NA),
+    border = FALSE,
+    axis_param = list(
+      side = "left",
+      at = log10(c(10,100,1000,10000,100000)),
+      labels = c("10","100","1000","10000","100000")
+    )
+  ),
+
+  show_annotation_name = TRUE,
+  annotation_name_side = "left",
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = 8, fontface = "bold"),
+  which = "column",
+
+  annotation_height = unit.c(
+    unit(4, "mm"),
+    unit(20, "mm")
+  )
+)
+
+#==================================================
+# HELPER: DRAW 2-SLICE PIE
+#==================================================
+
+draw_pie_cell <- function(x, y, r_mm, prop, fill_col, bg_col = "grey85") {
+  
+  if (is.na(prop)) return(NULL)
+  
+  prop <- max(min(prop, 1), 0)
+  values <- c(prop, 1 - prop)
+  fills  <- c(fill_col, bg_col)
+  
+  if (sum(values, na.rm = TRUE) == 0) return(NULL)
+  
+  pushViewport(viewport(
+    x = x,
+    y = y,
+    width = unit(2 * r_mm, "mm"),
+    height = unit(2 * r_mm, "mm"),
+    just = c("center", "center")
+  ))
+  
+  theta <- c(0, cumsum(values) * 2 * pi)
+  
+  for (k in 1:2) {
+    if (values[k] <= 0) next
+    
+    ang <- seq(theta[k], theta[k + 1], length.out = 100)
+    
+    xs <- c(0.5, 0.5 + 0.5 * cos(ang), 0.5)
+    ys <- c(0.5, 0.5 + 0.5 * sin(ang), 0.5)
+    
+    grid.polygon(
+      x = unit(xs, "npc"),
+      y = unit(ys, "npc"),
+      gp = gpar(fill = fills[k], col = NA)
+    )
+  }
+  
+  popViewport()
+}
+
+#==================================================
+# HEATMAP
+#==================================================
+
+
+ht <- Heatmap(
+  layout_mat,
+  name = NULL,
+  col = c("0" = "white"),
+  show_heatmap_legend = FALSE,
+  rect_gp = gpar(col = "grey85", fill = NA),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  
+  show_row_names = TRUE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 8),
+  show_column_names = FALSE,
+  
+  # left_annotation = left_ha,
+  top_annotation = top_ha,
+  bottom_annotation = bottom_ha,
+  right_annotation = right_ha,
+  
+  
+  #column_title = "Number of chemicals in group",
+  #column_title_side = "bottom",
+  #column_title_gp = gpar(fontsize = 8, fontface = "bold"),
+  
+  width = unit(nc * cell_w_mm, "mm"),
+  height = unit(nr * cell_h_mm, "mm"),
+  
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    
+    w_mm <- convertWidth(width, "mm", valueOnly = TRUE)
+    h_mm <- convertHeight(height, "mm", valueOnly = TRUE)
+    
+    # Skip empty or missing cells if needed
+    if (is.na(fill_prop_t[i, j])) return(NULL)
+    
+    # Fixed pie size
+    r_mm <- pie_r_factor * min(w_mm, h_mm)
+    
+    draw_pie_cell(
+      x = x,
+      y = y,
+      r_mm = r_mm,
+      prop = fill_prop_t[i, j],
+      fill_col = row_cat_cols[row_category[i]],
+      bg_col = "grey85"
+    )
+  }
+)
+
+
+#==================================================
+# LEGENDS
+#==================================================
+
+
+lgd_rowcat <- Legend(
+  title = "Data Type",
+  labels = names(row_cat_cols),
+  legend_gp = gpar(fill = unname(row_cat_cols), col = NA),
+  title_gp = gpar(fontsize = 8),
+  labels_gp = gpar(fontsize = 7)
+)
+
+
+lgd_sector <- Legend(
+  title = "Sector",
+  labels = names(sector_cols),
+  legend_gp = gpar(fill = unname(sector_cols), col = NA),
+  title_gp = gpar(fontsize = 8),
+  labels_gp = gpar(fontsize = 7)
+)
+
+lgd_kingdom <- Legend(
+  title = "Kingdom",
+  labels = names(kingdom_cols),
+  legend_gp = gpar(fill = unname(kingdom_cols), col = NA),
+  title_gp = gpar(fontsize = 8),
+  labels_gp = gpar(fontsize = 7)
+)
+
+#==================================================
+# DRAW TO SCREEN
+#==================================================
+
+pd <- packLegend(
+  lgd_sector,
+  lgd_kingdom,
+  lgd_rowcat,
+  direction = "horizontal",
+  gap = unit(6, "mm")
+)
+
+filename<-"Output/uselandscape_fig3.png"
+png(filename,
+  width = 10,
+  height =7,
+  units = "in",
+  res = 300
+)
+
+draw(
+  ht,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  annotation_legend_list = list(pd)
+)
+
+dev.off()
+return(filename)
+}
+
+
+#this handled differently because it is a complex heatmap and not a ggplot object
+final_plot<-do_uselandscape_plot()
+preview_file <- preview_png(final_plot,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+```
+
+Function plots in Chemical Space: Supplemental Figure S2
+
+```{r}
+#
+#FUNCTION
+do_function_plots<- function() {
+
+library(ggplot2)
+
+j<-fingerprints
+
+#merge
+#j<-left_join(j,cichemid,by=c("cicomp_id"="cicomp"))
+tmp<-left_join(inventory_all_descriptors2, j, by=c("cichem_id"="cichem"))
+
+#Decide which categories to keep
+
+#order the levels of function
+funccounts<-data.frame(table(tmp$most_common_function_category))
+keepfunctions<-funccounts$Var1[which(funccounts$Freq>200)]
+
+keepfunctions<-keepfunctions[keepfunctions!="NA"]
+keepfunctions<-keepfunctions[keepfunctions!="NANA"]
+keepfunctions<-keepfunctions[!is.na(keepfunctions)]
+keepfunctions<-keepfunctions[keepfunctions!="unknown"]
+keepfunctions<-keepfunctions[keepfunctions!="Unknown"]
+
+tmp$most_common_function_category2 <- factor(tmp$most_common_function_category, levels = keepfunctions)
+                                                                                                                                                                                    
+colors<-sample(ULcolors, length(unique(tmp$most_common_function_category2)), replace = TRUE)
+tmp2<-tmp[which(tmp$most_common_function_category2!="Unknown"),]
+#tmp2<-tmp[which(tmp$most_common_function_category=="Biocide"),]
+functiondensity<-ggplot(tmp2, aes(x=densmap_1, y=densmap_2,color=most_common_function_category2)) +
+  geom_point(alpha=0.4, size=1, shape=16) +
+  theme_minimal() +
+  scale_color_manual(values=colors) +
+  theme(legend.title = element_blank())+
+#scale to max and min x and y
+  #ylim(min(tmp2$densmap_2),max(tmp2$densmap_2))+xlim(min(tmp2$densmap_1),max(tmp2$densmap_1))
+  ylim(-5,20)+xlim(-10,20)+ guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+
+
+#do the previous plot but facet on most common function
+keepfunctions<-funccounts$Var1[which(funccounts$Freq>80)]
+
+keepfunctions<-keepfunctions[keepfunctions!="NA"]
+keepfunctions<-keepfunctions[keepfunctions!="NANA"]
+keepfunctions<-keepfunctions[!is.na(keepfunctions)]
+keepfunctions<-keepfunctions[keepfunctions!="unknown"]
+keepfunctions<-keepfunctions[keepfunctions!="Unknown"]
+
+length(keepfunctions)
+
+tmp$most_common_function_category2 <- factor(tmp$most_common_function_category, levels = keepfunctions)
+
+# set.seed(126)
+# colors<-sample(ULcolors, length(unique(tmp$most_common_function_category2)), replace = TRUE)
+# functionfacet<-ggplot(tmp[tmp$most_common_function_category2 %in% keepfunctions,], aes(x=densmap_1, y=densmap_2,color=most_common_function_category2)) +
+#   geom_point(alpha=1,size=0.5, shape=16) +
+#   theme_minimal() +
+#   scale_color_manual(values=colors) +
+#   theme(legend.title = element_blank())+
+#   ylim(-5,20)+xlim(-10,20)+
+#   facet_wrap(~most_common_function_category2)
+# print(functionfacet)
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+set.seed(126)
+
+colors <- sample(
+  ULcolors,
+  length(keepfunctions),
+  replace = TRUE
+)
+
+names(colors) <- keepfunctions
+
+tmp_plot <- tmp %>%
+  select(densmap_1, densmap_2, most_common_function_category2) %>%
+  mutate(
+    most_common_function_category2 = as.character(most_common_function_category2)
+  )
+
+tmp_facet <- expand_grid(
+  facet_function = as.character(keepfunctions),
+  tmp_plot
+) %>%
+  mutate(
+    facet_function = as.character(facet_function),
+    has_facet_function = most_common_function_category2 == facet_function
+  )
+
+functionfacet <- ggplot() +
+
+  geom_point(
+    data = tmp_facet %>% filter(!has_facet_function),
+    aes(x = densmap_1, y = densmap_2),
+    color = "grey80",
+    alpha = 0.3,
+    size = 0.5,
+    shape = 16
+  ) +
+
+  geom_point(
+    data = tmp_facet %>% filter(has_facet_function),
+    aes(
+      x = densmap_1,
+      y = densmap_2,
+      color = facet_function
+    ),
+    alpha = 1,
+    size = 0.5,
+    shape = 16
+  ) +
+  #no x or y labels
+  ylab("")+xlab("")+
+
+  scale_color_manual(values = colors) +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  coord_cartesian(
+    xlim = c(-10, 20),
+    ylim = c(-5, 20)
+  ) +
+  facet_wrap(~facet_function)+theme(legend.position = "none")
+
+
+return(  list(
+    plot1 = functiondensity,
+    plot2 = functionfacet
+  ))
+
+}
+
+k<-do_function_plots()
+# filename<-"Output/function_structure.png"
+# ggsave(
+#   filename = filename,
+#   plot = k[[1]],
+#   width = 13,
+#   height = 7,
+#   dpi = 300
+# )
+# preview_file <- preview_png(filename,
+#   scale = 0.3
+# )
+# knitr::include_graphics(preview_file)
+
+filename<-"Output/function_facet.png"
+ggsave(
+  filename = filename,
+  plot = k[[2]],
+  width = 15,
+  height = 10,
+  dpi = 300
+)
+
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+```
+
+Examine functional use space of "industrial only" chemicals on the inventory with predicted function: Figure S3
+```{r}
+do_function_industrial_only_plot = function() {
+
+load("Data/inventory_all_descriptors2.RData")
+load("Data/fingerprints.RData")
+
+j<-fingerprints
+tmp<-left_join(inventory_all_descriptors2, j, by=c("cichem_id"="cichem"))
+
+inventory_all_descriptors2$region_class<-NA
+sum<- inventory_all_descriptors2$Africa+inventory_all_descriptors2$Asia+inventory_all_descriptors2$Europe+inventory_all_descriptors2$`Latin America`+inventory_all_descriptors2$Oceania+inventory_all_descriptors2$`North America`+inventory_all_descriptors2$Global
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$Africa==1 & sum==1)]<-"Africa"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$Asia==1 & sum==1)]<-"Asia"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$Europe==1 & sum==1)]<-"Europe"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$`Latin America`==1 & sum==1)]<-"Latin America"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$Oceania==1 & sum==1)]<-"Oceania"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$`North America`==1 & sum==1)]<-"North America"
+inventory_all_descriptors2$region_class[which(inventory_all_descriptors2$Global==1 & sum==1)]<-"Multiple Regions or Multinational Inventory"
+inventory_all_descriptors2$region_class[which(sum>1)]<-"Multiple Regions or Multinational Inventory"
+       
+
+#Which Industrial Only chemicals come from different regions
+industrial_only<-tmp[which(tmp$sector_class=="Industrial Only"),]
+table(industrial_only$region_class)
+industrial_only<-industrial_only[which(!is.na(industrial_only$region_class)),]
+
+
+regioncolors<-c("Asia"=  "#B38874","Europe"=  "#00A451","Latin America"=  "#BCBEC0","North America"="#122C49","Oceania"="#00CAFB", "Multiple Regions or Multinational Inventory"="#CA0123")
+
+# industrialregions<-ggplot(industrial_only, aes(x=densmap_1, y=densmap_2, color=region_class)) +
+#   geom_point(alpha=0.8) +
+#   theme_minimal() +
+#   scale_color_manual(values=regioncolors) +
+#   theme(legend.title = element_blank())+  ylim(-5,20)+xlim(-10,20)+
+#   facet_wrap(~region_class)
+# 
+# ggsave(
+#   filename = "Output/industrial_only_region_landscape.png",
+#   plot = industrialregions,
+#   width = 15,
+#   height = 10,
+#   dpi = 300
+# )
+
+#look at the predicted function of industrial only chemicals by region
+
+#QSUR values from CIEXPO-Use
+load("Data/function_use.RData")
+
+#highly predicted function is >0.5
+function_use_high<-function_use[which(function_use$probability>0.8),]
+
+industrial_only_function2<-left_join(industrial_only, function_use_high, by="cichem_id")
+
+#to remove bias, only include cichems that were run through QSUR
+industrial_only_function2<-industrial_only_function2[which(industrial_only_function2$cichem_id %in% function_use$cichem_id),]
+
+industrial_only_function2$harmonized_functional_use[which(is.na(industrial_only_function2$harmonized_functional_use))]<-" No Valid Prediction"
+
+#combine for plotting
+j2<-data.frame(table(industrial_only_function2$harmonized_functional_use))
+
+#take the top functions as noted by j2$Freq, call rest "Other"
+
+industrial_only_function2$harmonized_functional_use[which(industrial_only_function2$harmonized_functional_use %in% j2$Var1[which(j2$Freq<1000)])]<-"Other"
+
+industrial_only_function2$harmonized_functional_use<-capitalize_first(industrial_only_function2$harmonized_functional_use)
+
+#make a barplot of counts of predicted function by region
+library(ggplot2)
+funcplot<-ggplot(industrial_only_function2, aes(x=harmonized_functional_use, fill=region_class)) +
+  geom_bar(position="dodge") +
+  theme_minimal() +
+  #labs(title="t-SNE of Chemical Descriptors Colored by Sector Class") +
+  scale_fill_manual(values=regioncolors) +
+  theme(legend.title = element_blank())+  
+  xlab("Predicted Function Category") + ylab("Count of Chemicals") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+#print(funcplot)
+
+
+#what about reported functions?
+#make a barplot of counts of most common function by region
+industrial_only2<-industrial_only[!is.na(industrial_only$most_common_function_category),]
+j3<-data.frame(table(industrial_only2$most_common_function_category))
+
+industrial_only2$most_common_function_category[which(industrial_only2$most_common_function_category %in% j3$Var1[which(j3$Freq<10)])]<-"Other"
+industrial_only2$most_common_function_category<-capitalize_first(industrial_only2$most_common_function_category)
+
+library(ggplot2)
+funcplot2<-ggplot(industrial_only2, aes(x=most_common_function_category, fill=region_class)) +
+  geom_bar(position="dodge") +
+  theme_minimal() +
+  #labs(title="t-SNE of Chemical Descriptors Colored by Sector Class") +
+  scale_fill_manual(values=regioncolors) +
+  theme(legend.title = element_blank())+  
+  xlab("Reported Function Category") + ylab("Count of Chemicals") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  #ADD SPACE ON LEFT FOR LABELS
+  theme(plot.margin = unit(c(1,1,1,3), "cm"))
+
+return(  list(
+    plot1 = funcplot,
+    plot2 = funcplot2
+  ))
+
+}
+
+
+k<-do_function_industrial_only_plot()
+
+filename<-"Output/industrial_only_function_by_region.png"
+ggsave(
+  filename = filename,
+  plot = k[[1]],
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+filename<-"Output/industrial_only_reported_function_by_region.png"
+ggsave(
+  filename = filename,
+  plot = k[[2]],
+  height = 6,
+  dpi = 300
+)
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+```
+
+Monitoring Landscape Visualization: Figure 4
+
+```{r}
+
+do_monitoring_plot = function() {
+  
+  #Monitoring Figure
+
+  load("Data/monitoring_landscape_data_2026-10-12.RData")
+  monitoring[is.na(monitoring)]<-0
+  
+  #mon<-left_join(monitoring,cichemid, by=c("DTXSID"="dtxsid"))
+  mon<-monitoring
+  
+  #move cichem_id to first column
+  mon<-mon[,c("cichem_id",colnames(mon)[!colnames(mon) %in% c("cichem_id")])]
+  
+  mon[is.na(mon)]<-0
+  tmp<-mon[3:39]
+  k<-colSums(tmp)
+  mon<-mon[,!colnames(mon)=="X"]
+  
+  mon2<-left_join(mon, inventory_all_descriptors2, by=c("cichem_id"="cichem_id"))
+  
+  namestokeep1<-colnames(mon)[!colnames(mon) %in% c("DTXSID","cichem_id","cicomp")]
+  
+  mon2<-mon2[which(mon2$cichem %in% inventory_all_descriptors2$cichem),]
+  
+  
+  j<-mon2[,colnames(mon2) %in% c(namestokeep1)]
+  mon2$sum <- rowSums(j,na.rm = TRUE)
+  j<-j[order(mon2$sector_class,mon2$kingdom,-mon2$sum),]
+  mon2<-mon2[order(mon2$sector_class,mon2$kingdom),]
+  
+  j[] <- lapply(j, function(x) as.character(x) )
+  #Traditional Data
+  j[j==1]<-"Traditional Monitoring Data"
+  j$nontargeted_dust[which(j$nontargeted_dust!=0)]<-"NAM (NTA/Informatic)"
+  j$consumer_products[which(j$consumer_products!=0)]<-"NAM (NTA/Informatic)"
+  j$nontargeted_drinkingwater[which(j$nontargeted_drinkingwater!=0)]<-"NAM (NTA/Informatic)"
+  j$pooled_blood[which(j$pooled_blood!=0)]<-"NAM (NTA/Informatic)"
+  j$NTA_biomonitoring_curation[which(j$NTA_biomonitoring_curation!=0)]<-"NAM (NTA/Informatic)"
+  #j$BloodExposomeDB[which(j$BloodExposomeDB!=0)]<-"NAM (NTA/Informatic)"
+  
+  j[j==0]<-"No Data"
+  
+  
+  set1=ULcolors[1:9]
+  
+  colors1 = structure(c("#D3D3D3",tradcolor, namcolor), names = c("No Data", "Traditional Monitoring Data", "NAM (NTA/Informatic)"))
+  colors2 = ULcolors[c(1:7)]
+  colors3 = c("#969696","#636363","#252525","#f7f7f7")
+  names(colors2) = unique(mon2$sector_class)
+  #update colors
+  colors2["Industrial Only"] = ind_color
+  colors2["Consumer Only"] = consumer_color
+  colors2["Multiple Inventories"] = multiple_color
+  colors2["Unknown"] = unknown_color
+  colors2["Pharmaceutical Only"] = pharma_color
+  colors2["Agricultural Only"] = ag_color
+  colors2["Food Only"] = food_color
+  
+  names(colors3) = unique(mon2$kingdom)
+  colors3["Organic compounds"] = orgcolor
+  colors3["Inorganic compounds"] = inorgcolor
+  colors3["Unstructurable"] = unstructcolor
+  colors3["Unknown"] = unknown_color
+  
+  #col_fun = colorRamp2(c(1, 2, 3), c("#D3D3D3",set1[1], set1[2], set1[3]))
+  foo = function(x){
+    length(which(x!="No Data"))
+  }
+  
+  
+  #col_fun = colorRamp2(c(1, 2, 3), c("#D3D3D3",set1[1], set1[2], set1[3]))
+  foo = function(x){
+    length(which(x!="No Data"))
+  }
+  
+  counts<-sapply(j,foo)
+  
+  
+  j<-j[,!colnames(j) %in% c("unknown","precipitation","other.ecological","other.environmental")]
+  
+  
+  #reorder
+  j<-j[,c("wildlife..fish.","wildlife..aquatic.invertebrate.","wildlife..aquatic.vertebrates.mammals.","wildlife..terrestrial.vertebrates.","wildlife..birds.","wildlife..terrestrial.invertebrates.worms.",                          
+          "sediment","surface.water", "soil", "wastewater..influent..effluent.", "groundwater","landfill.leachate","sludge","ambient.air",                                
+          "vegetation", "raw.agricultural.commodity","food.product", "livestock.meat","drinking.water",
+          "indoor.air","personal.air","product","indoor.dust","osha","urine","human.blood..whole.serum.plasma.",
+          "human..other.tissues.or.fluids.","skin.wipes","breast.milk","pdp","nontargeted_dust","pooled_blood","NTA_biomonitoring_curation","nontargeted_drinkingwater",                 
+          "consumer_products")] 
+  counts<-sapply(j,foo)
+  collabs<-c(
+    "Fish",
+    "Aquatic Invertebrates",
+    "Aquatic Vertebrates",
+    "Terrestrial Vertebrates",
+    "Birds",
+    "Terrestrial Invertebrates",
+    "Sediment",
+    "Surface Water",
+    "Soil",
+    "Wastewater",
+    "Groundwater",
+    "Landfill Leachate",
+    "Sludge",
+    "Ambient Air",
+    "Vegetation",
+    "Raw Agricultural Commodity",
+    "Food Product",
+    "Livestock/Meat",
+    "Drinking Water",
+    "Indoor Air",
+    "Personal Air",
+    "Product",
+    "Indoor Dust",
+    "Workplace (OSHA)",
+    "Human Urine",
+    "Human Blood",
+    "Human Other Tissues",
+    "Skin Wipes",
+    "Breast Milk",
+    "Crops (PDP)",
+    "Indoor Dust",
+    "Pooled Human Blood",
+    "Human Biomonitoring (Curated NTA)",
+    "Drinking Water",
+    "Consumer Products (Curated NTA)")
+
+  j_rot<-t(j)
+  row.names(j_rot)<-collabs
+  
+  #do heat map
+  library(ComplexHeatmap)
+  
+  width=12
+  height=10 
+  tradcol<-"#ef3b2c"
+  ylims=c(1, 5000)
+  kingdomvec=rev(mon2$kingdom)
+  inventoryvec=rev(mon2$sector_class)
+  collabs=collabs
+  row_splits=c(1,1,1,1,1,1,2,2,2,4)
+  name="Data Type"
+  row_title="Data"
+  column_title="Chemicals"
+  
+  ha_left <- rowAnnotation(
+    text = anno_text(
+      collabs,
+      rot = 0,
+      location = unit(1, "npc"),
+      just = "right",
+      offset = unit(0, "mm"),
+      gp = gpar(fontsize = 9),
+      width = max_text_width(collabs)
+    )
+  )
+  
+  ## ---- right-side annotation (was top annotation) ----
+  
+  mediacat<-c(rep("Wildlife",6),rep("Environmental",9),rep("Dietary",4),rep("Indoor",5),rep("Biomonitoring",5),rep("NTA",4))
+  mediacat<-factor(mediacat, levels=c("Wildlife","Environmental","Dietary","Indoor","Biomonitoring","NTA"))
+  
+  ha_right <- rowAnnotation(
+    counts = anno_barplot(
+      counts,
+      ylim = ylims,
+      add_numbers = FALSE,
+      width = unit(2, "cm"),
+      axis_param = list(side = "top")
+    ),
+    counts2 = anno_text(
+      counts,
+      rot = 0,
+      just = "left",
+      location = 0,
+      gp = gpar(fontsize = 9),
+      width = max_text_width(as.character(counts)) + unit(6, "mm")
+    ),
+    gap = unit(3, "mm"),
+    annotation_name_side = "top"
+  )
+  
+  ha_bottom <- HeatmapAnnotation(
+    Kingdom = kingdomvec,
+    Inventory = inventoryvec,
+    col = list(
+      Kingdom = colors3,
+      Inventory = colors2
+    ),
+    which = "column"
+  )
+  
+  k2 <- Heatmap(
+    j_rot,
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    col = colors1,
+    use_raster = FALSE,
+    name = name,
+    #row_title = row_title,
+    column_title = column_title,
+    row_names_gp = gpar(fontsize = 7),
+    
+    ## moved annotations
+    left_annotation  = ha_left,
+    right_annotation = ha_right,
+    bottom_annotation = ha_bottom,
+    
+    ## splits also swap when you rotate
+    #row_split    = row_splits,
+    column_split = inventoryvec,
+    
+    na_col = "white"
+  )
+  
+  
+  filename<-"Output/media_landscape.png"
+
+  png(filename, width = 10, height = 9, units="in", res = 300)
+  
+  draw(
+    k2,
+    heatmap_legend_side = "bottom",
+    annotation_legend_side = "bottom",
+    merge_legends = TRUE
+  )
+  dev.off()
+  return(filename)
+  
+#Save chemicals that have NTA biomonitoring
+NTA_chemicals<-mon2[which(mon2$NTA_biomonitoring_curation!=0 | mon2$consumer_products!=0),]
+
+#remove if it has been previously measured
+
+  
+}
+
+#this handled differently because it is a complex heatmap and not a ggplot object
+final_plot<-do_monitoring_plot()
+preview_file <- preview_png(final_plot,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+```
+
+
+MEDIA ANALYSES
+
+```{r}
+
+  load("data/monitoring_landscape_data_2026-10-12.Rdata")
+  monitoring[is.na(monitoring)]<-0
+  
+  load("data/categories/rocks_sector_table_2026-08-27.RData")
+  
+  #mon<-left_join(monitoring,cichemid, by=c("DTXSID"="dtxsid"))
+  mon<-monitoring
+  
+  #move cichem_id to first column
+  mon<-mon[,c("cichem_id",colnames(mon)[!colnames(mon) %in% c("cichem_id")])]
+  
+  mon[is.na(mon)]<-0
+  tmp<-mon[3:39]
+  k<-colSums(tmp)
+  mon<-mon[,!colnames(mon)=="X"]
+  
+  mon2<-left_join(mon, inventory_all_descriptors2, by=c("cichem_id"="cichem_id"))
+  
+  namestokeep1<-colnames(mon)[!colnames(mon) %in% c("DTXSID","cichem_id","cicomp")]
+  
+  mon2<-mon2[which(mon2$cichem %in% inventory_all_descriptors2$cichem),] #we want to limit to chemicals that are in the collection
+  
+  j<-mon2[,colnames(mon2) %in% c(namestokeep1)]
+  mon2$sum <- rowSums(j,na.rm = TRUE)
+  j<-j[order(mon2$sector_class,mon2$kingdom,-mon2$sum),]
+  mon2<-mon2[order(mon2$sector_class,mon2$kingdom),]
+  
+  j[] <- lapply(j, function(x) as.character(x) )
+  #Traditional Data
+  j[j==1]<-"Traditional Monitoring Data"
+  j$nontargeted_dust[which(j$nontargeted_dust!=0)]<-"NAM (NTA/Informatic)"
+  j$consumer_products[which(j$consumer_products!=0)]<-"NAM (NTA/Informatic)"
+  j$nontargeted_drinkingwater[which(j$nontargeted_drinkingwater!=0)]<-"NAM (NTA/Informatic)"
+  j$pooled_blood[which(j$pooled_blood!=0)]<-"NAM (NTA/Informatic)"
+  j$NTA_biomonitoring_curation[which(j$NTA_biomonitoring_curation!=0)]<-"NAM (NTA/Informatic)"
+  #j$BloodExposomeDB[which(j$BloodExposomeDB!=0)]<-"NAM (NTA/Informatic)"
+  
+  j[j==0]<-"No Data"
+  
+  paste0("Number of collection chemicals data: ", length(j$consumer_products))
+  
+   #Supplemental Table 2
+  #count the number of cells in each ROW that are NOT equal to "No Data"
+  NAM <- rowSums(j == "NAM (NTA/Informatic)" & !is.na(j))
+  Trad <- rowSums(j == "Traditional Monitoring Data" & !is.na(j))
+  
+  NAM<-ifelse(NAM>0,1,0)
+  Trad<-ifelse(Trad>0,1,0)
+  NAM_only<-ifelse(NAM==1 & Trad==0,1,0)
+  #Combine with sector_class and sector 
+  mon2$NAM<-NAM
+  mon2$Trad<-Trad
+  mon2$NAM_only<-NAM_only
+
+ mon3<-left_join(mon2,rocks_sector_table) 
+ k0<-c("All Chemicals",length(which(mon3$Trad==1)),   length(which(mon3$NAM==1)),length(which(mon3$NAM_only==1))) 
+ k1<-c("Industrial",length(which(mon3$industrial==1 & mon3$Trad==1)), length(which(mon3$industrial==1 & mon3$NAM==1)), length(which(mon3$industrial==1 & mon3$NAM_only==1)))
+ k2<-c("Food",length(which(mon3$food==1)), length(which(mon3$food==1 & mon3$NAM==1)), length(which(mon3$food==1 & mon3$NAM_only==1)))
+ k3<-c("Consumer",length(which(mon3$consumer==1)), length(which(mon3$consumer==1 & mon3$NAM==1)), length(which(mon3$consumer==1 & mon3$NAM_only==1)))
+ k4<-c("Pharmaceutical",length(which(mon3$pharmaceutical==1)), length(which(mon3$pharmaceutical==1 & mon3$NAM_only==1)), length(which(mon3$pharmaceutical==1 & mon3$NAM_only==1)))
+ k5<-c("Agricultural",length(which(mon3$agricultural==1)), length(which(mon3$agricultural==1 & mon3$NAM==1)), length(which(mon3$agricultural==1 & mon3$NAM_only==1)))
+ 
+ k6<-data.frame(table(mon3$sector_class[which(mon3$Trad==1)]))
+ colnames(k6)<-c("Sector_or_Class","Count with Traditional Monitoring Data")
+ k7<-data.frame(table(mon3$sector_class[which(mon3$NAM==1)]))
+ colnames(k7)<-c("Sector_or_Class","Count with NAM (NTA/Informatic) Data")
+ k8<-data.frame(table(mon3$sector_class[which(mon3$NAM_only==1)]))
+ colnames(k8)<-c("Sector_or_Class","Count with Only NAM Data")
+ 
+ k9<-left_join(k6,k7,by=c("Sector_or_Class"="Sector_or_Class")) 
+ k9<-left_join(k9,k8,by=c("Sector_or_Class"="Sector_or_Class"))
+ 
+ k<-data.frame(rbind(k0,k1,k2,k3,k4,k5))
+ colnames(k)<-c("Sector_or_Class","Count with Traditional Monitoring Data","Count with NAM (NTA/Informatic) Data","Count with Only NAM Data")
+
+ k$Sector_or_Class<-as.character(k$Sector_or_Class)
+ k9$Sector_or_Class<-as.character(k9$Sector_or_Class)
+ 
+ SupplementalTable2<-rbind(k,k9)
+
+ SupplementalTable2$Sector_or_Class[SupplementalTable2$Sector_or_Class=="industrial"]<-"Industrial"
+ SupplementalTable2$Sector_or_Class[SupplementalTable2$Sector_or_Class=="consumer"]<-"Consumer"
+ SupplementalTable2$Sector_or_Class[SupplementalTable2$Sector_or_Class=="agricultural"]<-"Agricultural"
+ SupplementalTable2$Sector_or_Class[SupplementalTable2$Sector_or_Class=="pharmaceutical"]<-"Pharmaceutical"
+ SupplementalTable2$Sector_or_Class[SupplementalTable2$Sector_or_Class=="food"]<-"Food"
+ SupplementalTable2<-SupplementalTable2[(!SupplementalTable2$Sector_or_Class=="Unknown"),]
+
+ print(SupplementalTable2)  
+ write.csv(SupplementalTable2,"Output/SupplementalTable5.csv",row.names = FALSE)
+  
+ #How many of the NTA consumer product and biomonitoring chemicals had no traditional monitoring data
+
+ paste0("Number of NTA consumer product chemicals with no traditional monitoring data: ", length(which(mon3$consumer_products==1 & mon3$Trad==0)))
+ paste0("Number of NTA biomonitoring chemicals with no traditional monitoring data: ", length(which(mon3$NTA_biomonitoring_curation==1 &  mon3$Trad==0)))
+ 
+# Number of new chemicals with monitoring data compared to Isaacs 2022
+new_chemicals<-length(j[,1])-2960 
+ paste0("Number of new chemicals with data since Isaacs 2022: ", new_chemicals)
+
+#which of the chemcials with data were multiple sector chemicals 
+multiple_sector_chems<-length(which(mon3$cichem_id %in% inventory_all_descriptors2$cichem_id[which(inventory_all_descriptors2$sector_class=="Multiple Inventories")]))
+
+paste0("Number of chemicals with data that are multiple sector chemicals: ", multiple_sector_chems," ", 5552/length(j[,1]) )
+
+
+#How many of the Consumer NTA chemicals were in CIExpo-Use product data?
+load("Data/ciexpo_use_mv_product_categories.RData")
+
+NTAconsumerchems<-mon3$cichem_id[which(mon3$consumer_products==1)]
+
+newchemicals<-length(NTAconsumerchems)-length(which(NTAconsumerchems %in% prods$cichem_id))
+
+paste0("Number of new NTA consumer chemicals with no CIExpo-Use product data, % with known product use: ", newchemicals, " ", length(which(NTAconsumerchems %in% prods$cichem_id))/length(NTAconsumerchems))
+
+#how many chemicals with trad data in media other than water/sediment from USGS?
+ cols<-colnames(j)[!colnames(j) %in% c("wastewater..influent..effluent.","groundwater","surface.water","sediment")]
+  Trad <- rowSums(j[,cols] == "Traditional Monitoring Data" & !is.na(j[,cols]))
+  Trad<-ifelse(Trad>0,1,0)
+
+paste0("Number of chemicals with traditional data beyond water and sediment: ", sum(Trad))
+  
+#How many NTA consumer chemicals had unknown sector (and were thus in collection from monitoring sources)
+numNTAconsumer_unknown<-length(which(mon3$consumer_products==1 & mon3$sector_class=="Unknown"))
+
+#How many NTA consumer chemicals had annotated consumer use?
+numNTAconsumer_consumer<-length(which(mon3$consumer_products==1 & mon3$consumer==1))
+
+#How many NTA consumer chemicals were Multiple Inventory Chemicals?
+numNTAconsumer_multiple<-length(which(mon3$consumer_products==1 & mon3$sector_class=="Multiple Inventories"))
+
+#How many NTA consumer chemicals only had known Industrial sector?
+numNTAconsumer_indonly<-length(which(mon3$consumer_products==1 & mon3$sector_class=="Industrial Only"))
+
+paste0("Number of NTA consumer chemicals with unknown sector: ", numNTAconsumer_unknown)
+paste0("Number of NTA consumer chemicals with known consumer sector: ", numNTAconsumer_consumer)
+paste0("Number of NTA consumer chemicals with known multiple inventory sector: ", numNTAconsumer_multiple)
+paste0("Number of NTA consumer chemicals with known industrial only sector: ", numNTAconsumer_indonly)
+       
+
+```
+
+
+
+Biomonitoring: Traditional versus NTA versus BloodExposomeDB: Figure S4
+
+```{r}
+do_method_plot = function() {
+#Look at structure and sector space of the levels of chemicals detected in humans
+
+load("Data/monitoring_landscape_data_2026-10-12.RData")
+load("Data/blood_db_CIIW_curated.RData")
+#load the most recent rocks_sector_table.RData file
+#find the most recent file in the directory
+files<-list.files("Data/categories", pattern = "rocks_sector_table.*\\.RData$", full.names = TRUE)
+file <- files[order(file.info(files)$mtime, decreasing = TRUE)][1]  # Get the most recent 
+load(file)
+
+
+j<-left_join(inventory_all_descriptors2, fingerprints, by=c("cichem_id"="cichem"))
+j<-left_join(j, rocks_sector_table[,c("cichem_id","pharmaceutical","agricultural","food","consumer","industrial")], by=c("cichem_id"="cichem_id"))
+j<-left_join(j, monitoring, by=c("cichem_id"="cichem_id"))
+j<-left_join(j, BloodExposomeDB, by=c("cichem_id"="cichem_id"))
+
+j[is.na(j)]<-0
+
+
+#Make flags for trad, NTA, and BloodExposomeDB
+cols <- c(
+  "human.blood..whole.serum.plasma.",
+  "human..other.tissues.or.fluids.",
+  "urine",
+  "skin.wipes",
+  "breast.milk"
+)
+
+j$trad_flag <- apply(j[, cols], 1, max, na.rm = TRUE)
+
+cols <- c(
+  "NTA_biomonitoring_curation",
+  "pooled_blood"
+)
+j$nta_flag<-apply(j[, cols], 1, max, na.rm = TRUE)
+
+j2<-j[,c("cichem_id","densmap_1","densmap_2","trad_flag","nta_flag","BloodExposomeDB","pharmaceutical","industrial","food","agricultural","consumer","inventory_environmental","inventory_biomonitoring")]
+
+#Make a Bar Chart of the number of chemicals with traditional monitoring, NTA, BloodExposomeDB, by sector
+
+j2_long <- j2 %>%
+  pivot_longer(
+    cols = c("pharmaceutical","industrial","food","agricultural","consumer","inventory_environmental","inventory_biomonitoring"),
+    names_to = "sector_class",
+    values_to = "sector_flag"
+  ) %>%
+  filter(sector_flag == 1)
+
+
+toplot <- j2_long %>%
+  pivot_longer(
+    cols = c("trad_flag", "nta_flag", "BloodExposomeDB"),
+    names_to = "method",
+    values_to = "value"
+  ) %>%
+  filter(value == 1) %>%
+  group_by(method, sector_class) %>%
+  summarise(
+    count = n_distinct(cichem_id),
+    .groups = "drop"
+  )
+
+all_chems <- j2_long %>%
+  group_by(sector_class) %>%
+  summarise(
+    count = n_distinct(cichem_id),
+    .groups = "drop"
+  ) %>%
+  mutate(method = "All Chemicals")
+
+toplot <- bind_rows(toplot, all_chems)
+
+# Add % coverage relative to all chemicals in each sector
+toplot_annot <- toplot %>%
+  group_by(sector_class) %>%
+  mutate(
+    all_count = count[method == "All Chemicals"][1],
+    pct_coverage = 100 * count / all_count,
+    label = if_else(
+      method == "All Chemicals",
+      "   ",
+      paste0(round(pct_coverage, 1), "%")
+    )
+  ) %>%
+  ungroup()
+
+toplot_annot$sector_class[toplot_annot$sector_class=="inventory_biomonitoring"]<-"biomonitoring"
+toplot_annot$sector_class[toplot_annot$sector_class=="inventory_environmental"]<-"environmental"
+
+#capitalize all
+toplot_annot$sector_class<-capitalize_first(toplot_annot$sector_class)
+
+
+sector_order <- c(
+  "Pharmaceutical",
+  "Industrial",
+  "Food",
+  "Agricultural",
+  "Consumer",
+  "Environmental",
+  "Biomonitoring"
+)
+
+toplot_annot <- toplot_annot %>%
+  mutate(
+    sector_class = factor(sector_class, levels = sector_order)
+  )
+
+pd <- position_dodge(width = 0.9)
+
+barplot <- ggplot(toplot_annot, aes(x = sector_class, y = count, fill = method)) +
+geom_bar(
+  stat = "identity",
+  position = pd,
+  width = 0.7
+) +
+  geom_text(
+    data = toplot_annot,
+    aes(label = label),
+    position = pd,
+    vjust = -0.3,
+    size = 3
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Number of Chemicals Detected in Humans by Method and Sector Class",
+    x = "Sector Class",
+    y = "Number of Chemicals"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "trad_flag" = tradcolor,
+      "nta_flag" = namcolor,
+      "BloodExposomeDB" = bloodexcolor,
+      "All Chemicals" = "gray"
+    ),
+labels = c(
+   "trad_flag" = "Targeted Biomonitoring",
+   "nta_flag" = "NTA",
+   "BloodExposomeDB" = "Blood Exposome DB",
+   "All Chemicals" = "All Chemicals"
+)
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_y_continuous(
+    trans = "log10"
+  )+ theme(legend.title = element_blank())
+
+#Now do a densemap plot of the chemicals detected in humans by method
+
+j3<-j[,c("cichem_id","densmap_1","densmap_2","trad_flag","nta_flag","BloodExposomeDB","inventory_biomonitoring")]
+
+#plot Blood exposome points
+p1<-ggplot(j3, aes(x=densmap_1, y=densmap_2)) +
+  geom_point(data=j3[which(j3$inventory_biomonitoring==0),], aes(color="gray"),alpha=0.1, size=0.6, shape=16)+
+  geom_point(data=j3[which(j3$BloodExposomeDB==1),], aes(color="Blood Exposome DB"),alpha=0.3, size=0.6, shape=16) +
+  geom_point(data=j3[which(j3$nta_flag==1),], aes(color="NTA"), alpha=0.7, size=0.9, shape=16) +
+  geom_point(data=j3[which(j3$trad_flag==1),], aes(color="Targeted Biomonitoring"), alpha=0.7, size=1, shape=16) +
+  theme_minimal() +
+  labs(title="Structure Space of Chemicals Detected in Humans", x=" ", y=" ") +
+  scale_color_manual(values=c("Targeted Biomonitoring"=tradcolor, "NTA"=namcolor, "Blood Exposome DB"=bloodexcolor)) +
+  theme(legend.title = element_blank()) + 
+  ylim(-5,20)+xlim(-10,20)+ guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+list<-list(barplot, p1)
+
+}
+
+k<-do_method_plot()
+filename<-"Output/biomonitoring_method_coverage.png"
+ggsave(
+  filename = filename,
+  plot = k[[1]],
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+k<-do_method_plot()
+filename<-"Output/biomonitoring_method_mapping.png"
+ggsave(
+  filename = filename,
+  plot = k[[2]],
+#plot = p1,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+preview_file <- preview_png(filename,
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+
+```
+
+Exposure prediction landscape plots: Figure 5, Figure S6, Figure S7
+
+```{r}
+#exposure prediction landscape
+do_exposure_prediction_plot = function() {
+
+j<-fingerprints
+#j<-left_join(j,cichemid,by=c("cicomp_id"="cicomp"))
+tmp<-left_join(inventory_all_descriptors2, j, by=c("cichem_id"="cichem"))
+
+tmp$x<-tmp$densmap_1
+tmp$y<-tmp$densmap_2
+
+#Inferences from CIEXPO-Intake
+load("data/inferences.RData")
+
+#load in new SEEM 3.1 predictions for inventory chemicals
+deltas<-readRDS("data/seem/inventory_deltas_2026-07-26.RDS")
+load("data/seem/seem-preds-2026-07-26.RData")
+load("data/seem/chem.preds-2026-07-26.RData")
+
+seem<-cbind(a, seem.preds)
+
+outsideseemdomain<-deltas$cichem[which(deltas$delta.Res.pred<0.5 & deltas$delta.Indust.pred<0.5 & deltas$delta.Diet.pred<0.5 & deltas$delta.Pest.pred<0.5)]
+
+paste0("Number of chemicals outside SEEM domain: ", length(outsideseemdomain))
+
+seem$in_seem_ad<-1
+seem$seem_diet<-0
+seem$seem_industrial<-0
+seem$seem_consumer<-0
+seem$seem_pesticide<-0
+seem$seem_diet<-0
+seem$seem_industrial<-0
+seem$seem_consumer<-0
+seem$seem_pesticide<-0
+seem$seem_diet[which(seem$delta.Diet.pred>0.5)]<-1
+seem$seem_industrial[which(seem$delta.Indust.pred>0.5)]<-1
+seem$seem_consumer[which(seem$delta.Res.pred>0.5)]<-1
+seem$seem_pesticide[which(seem$delta.Pest.pred>0.5)]<-1
+seem$in_seem_ad[which(seem$cichem_id %in% outsideseemdomain)]<-0
+
+#Make a bar plot showing what fraction of each sector is in domain of each pathway.
+
+j<-left_join(tmp, seem[,c("cichem","seem_diet","seem_industrial","seem_consumer","seem_pesticide","in_seem_ad","seem3","seem3.u95","seem3.l95")], by=c("cichem_id"="cichem"))
+j<-j[which(j$cichem_id %in% seem$cichem),] #only include chemicals we could run 
+j<-left_join(j, rocks_sector_table[,c("cichem_id","pharmaceutical","agricultural","food","consumer","industrial")], by=c("cichem_id"="cichem_id"))
+
+#Make a Bar Chart of the number of chemicals trad, nta, blood by sector
+
+j2<-j[,c("cichem_id","densmap_1","densmap_2","seem_diet","seem_industrial","seem_pesticide","seem_consumer","in_seem_ad","seem3","seem3.u95","seem3.l95","pharmaceutical","industrial","food","agricultural","consumer","inventory_environmental","inventory_biomonitoring")]
+
+
+j2_long <- j2 %>%
+  pivot_longer(
+    cols = c("pharmaceutical","industrial","food","agricultural","consumer","inventory_environmental","inventory_biomonitoring"),
+    names_to = "sector_class",
+    values_to = "sector_flag"
+  ) %>%
+  filter(sector_flag == 1)
+
+toplot <- j2_long %>%
+  pivot_longer(
+    cols = c("seem_diet", "seem_industrial", "seem_pesticide", "seem_consumer"),
+    names_to = "Pathway",
+    values_to = "value"
+  ) %>%
+  group_by(Pathway, sector_class) %>%
+  summarise(
+    count = n_distinct(cichem_id),
+    #count where ==1
+    in_domain = sum(value == 1, na.rm = TRUE)/count,
+    .groups = "drop"
+  )
+
+toplot$sector_class[toplot$sector_class=="inventory_biomonitoring"]<-"biomonitoring"
+toplot$sector_class[toplot$sector_class=="inventory_environmental"]<-"environmental"
+toplot$sector_class<-capitalize_first(toplot$sector_class)
+
+sector_order <- c(
+  "Pharmaceutical",
+  "Industrial",
+  "Food",
+  "Agricultural",
+  "Consumer",
+  "Environmental",
+  "Biomonitoring"
+)
+
+toplot <- toplot %>%
+  mutate(
+    sector_class = factor(sector_class, levels = sector_order)
+  )
+
+#Make 4 plots, one for each pathway, showing overlapping bars with the total chem count behind and the count in
+#domain in front
+
+library(ggplot2)
+
+g1 <- ggplot(
+  toplot[toplot$Pathway == "seem_consumer", ],
+  aes(x = sector_class)
+) +
+  geom_col(
+    aes(y = 1),
+    fill = "grey80",
+    width = 0.8
+  ) +
+  geom_col(
+    aes(y = in_domain),
+    fill = "#2C7FB8",
+    width = 0.8
+  ) +
+  geom_text(
+    aes(y = 1.02, label = count),
+    vjust = 0,
+    size = 4
+  ) +
+  coord_cartesian(ylim = c(0, 1.1), clip = "off") +
+  labs(
+    x = NULL,
+    y = "Fraction in Domain"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_blank()
+  )+ggtitle("SEEM Consumer Pathway")
+
+
+g2 <- ggplot(
+  toplot[toplot$Pathway == "seem_diet", ],
+  aes(x = sector_class)
+) +
+  geom_col(
+    aes(y = 1),
+    fill = "grey80",
+    width = 0.8
+  ) +
+  geom_col(
+    aes(y = in_domain),
+    fill = "#2C7FB8",
+    width = 0.8
+  ) +
+  geom_text(
+    aes(y = 1.02, label = count),
+    vjust = 0,
+    size = 4
+  ) +
+  coord_cartesian(ylim = c(0, 1.1), clip = "off") +
+  labs(
+    x = NULL,
+    y = "Fraction in Domain"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_blank()
+  )+ggtitle("SEEM Dietary Pathway")
+
+g3 <- ggplot(
+  toplot[toplot$Pathway == "seem_pesticide", ],
+  aes(x = sector_class)
+) +
+  geom_col(
+    aes(y = 1),
+    fill = "grey80",
+    width = 0.8
+  ) +
+  geom_col(
+    aes(y = in_domain),
+    fill = "#2C7FB8",
+    width = 0.8
+  ) +
+  geom_text(
+    aes(y = 1.02, label = count),
+    vjust = 0,
+    size = 4
+  ) +
+  coord_cartesian(ylim = c(0, 1.1), clip = "off") +
+  labs(
+    x = NULL,
+    y = "Fraction in Domain"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_blank()
+  )+ggtitle("SEEM Pesticide Pathway")
+
+g4 <- ggplot(
+  toplot[toplot$Pathway == "seem_industrial", ],
+  aes(x = sector_class)
+) +
+  geom_col(
+    aes(y = 1),
+    fill = "grey80",
+    width = 0.8
+  ) +
+  geom_col(
+    aes(y = in_domain),
+    fill = "#2C7FB8",
+    width = 0.8
+  ) +
+  geom_text(
+    aes(y = 1.02, label = count),
+    vjust = 0,
+    size = 4
+  ) +
+  coord_cartesian(ylim = c(0, 1.1), clip = "off") +
+  labs(
+    x = NULL,
+    y = "Fraction in Domain"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_blank()
+  )+ggtitle("SEEM Industrial Pathway")
+
+library(patchwork)
+#make 2x 2
+pathway_coverage<-(g1 | g2) / (g3 | g4) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+j$combo_sector<-paste0(j$pharmaceutical,j$industrial,j$food,j$agricultural,j$consumer,j$inventory_environmental,j$inventory_biomonitoring)
+
+combocounts<-data.frame(table(j$combo_sector))
+
+keepcombos<-combocounts[which(combocounts$Freq>200),]
+
+#generate a ridgeline plot of seem_50 of chemicals for each combo_sector, colored by the number of chemicals in each combo_sector
+
+library(dplyr)
+library(ggplot2)
+library(ggridges)
+library(forcats)
+
+
+toplot<-j[which(j$combo_sector %in% keepcombos$Var1),]
+
+cats <- c("pharmaceutical","agricultural","food","consumer","industrial","inventory_biomonitoring","inventory_environmental") 
+catnames <- c("Pharmaceutical","Agricultural","Food","Consumer","Industrial","Biomonitoring","Environmental" )
+
+toplot$combo_name <- apply(
+  toplot[, cats],
+  1,
+  function(x) {
+    paste(catnames[as.logical(x)], collapse = "+")
+  }
+)
+
+combo_levels <- toplot %>%
+  group_by(combo_name) %>%
+  summarise(
+    median_log = median(log10(seem3), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(median_log) %>%
+  pull(combo_name)
+
+
+ridge_dat <- toplot %>%
+  filter(
+    !is.na(combo_name),
+    !is.na(seem3),
+    is.finite(seem3)
+  ) %>%
+  group_by(combo_name) %>%
+  mutate(
+    median_exposure = median(seem3, na.rm = TRUE),
+    n_combo = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    combo_name = factor(combo_name, combo_levels)
+  )
+
+
+ridge<-ggplot(
+  ridge_dat,
+  aes(
+    x = seem3,
+    y = combo_name,
+    fill = after_stat(x)
+  )
+) +
+  geom_density_ridges_gradient(
+    scale = 2.5,
+    rel_min_height = 0.01,
+    alpha = 0.9,
+    color = "white",
+    linewidth = 0.25
+  ) +
+  scale_x_log10() +
+  scale_fill_viridis_c(
+    option = "magma",
+    trans = "log10",
+    name = "Exposure"
+  ) +
+  labs(
+    x = "Predicted exposure",
+    y = NULL,
+    title = "Distribution across chemicals of SEEM3.1 Median Intakes (mg/kg-BW/day)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 7),
+    panel.grid.major.y = element_blank(),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+
+#merge
+#j<-left_join(j,cichemid,by=c("cicomp_id"="cicomp"))
+tmp<-left_join(inventory_all_descriptors2, fingerprints, by=c("cichem_id"="cichem"))
+tmp<-left_join(tmp, seem[,c("cichem","seem_diet","seem_industrial","seem_consumer","seem_pesticide","in_seem_ad","seem3","seem3.u95","seem3.l95")], by=c("cichem_id"="cichem"))
+
+
+
+#tmp<-tmp[which(!is.na(tmp$densmap_1)),] #structurable
+
+#Other predictions from CIExpo-Intake
+tmp$seem_class<-"No Exposure Prediction"
+tmp$seem_class[which(tmp$cichem_id %in% seem$cichem)]<-"SEEM Prediction"
+tmp$seem_class[which(tmp$cichem_id %in% inferences$cichem_id)]<-"Inferred from NHANES"
+tmp$seem_class[which(tmp$cichem_id %in% outsideseemdomain)]<-"Outside SEEM Applicability Domain"
+
+tmp$uncrange<-log10(tmp$seem3.u95-tmp$seem3.l95)
+tmp$uncrange<-tmp$seem3.u95-tmp$seem3.l95
+#tmp$uncrange<-log10(tmp$seem3.u95)-log10(tmp$seem3.l95)
+
+
+#make histogram of uncrange by sector_class
+seemuncmain<-ggplot(
+  tmp[tmp$seem_class != "Outside SEEM Applicability Domain", ],
+  aes(x = sector_class, y = uncrange)
+) +
+#  geom_boxplot(outlier.shape = NA) +
+    geom_boxplot() +
+  scale_y_log10() +
+  xlab("") + 
+  ylab("Width of 95% Credible Interval (mg/kg-BW/day)")+
+  coord_cartesian(
+     ylim = c(1e-12, 1e6)
+   )
+
+seemuncinset<-ggplot(
+  tmp[tmp$seem_class != "Outside SEEM Applicability Domain", ],
+  aes(x = sector_class, y = uncrange)
+) +
+geom_boxplot(outlier.shape = NA) +
+#    geom_boxplot() +
+  scale_y_log10() +
+  xlab("") + 
+  ylab("")+ coord_cartesian(
+    ylim = c(5e-5, 5e-3)
+  )
+
+seemuncinset <- seemuncinset +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+library(patchwork)
+
+
+seemunc<-
+seemuncmain +
+  inset_element(
+    seemuncinset,
+    left = 0.05,
+    bottom = 0.65,
+    right = 0.45,
+    top = 1
+  )
+
+
+tmp2 <- tmp %>%
+  mutate(seem_class = factor(seem_class, levels = c("No Exposure Prediction", "SEEM Prediction", "Inferred from NHANES","Outside SEEM Applicability Domain"))) %>%
+  arrange(seem_class)
+
+typecolors<-c("SEEM Prediction"=  "#00689C","Inferred from NHANES"=  "black","No Exposure Prediction"=  "#BCBEC0","Outside SEEM Applicability Domain"="#CA0123")
+
+seemclass<-ggplot(tmp2, aes(x=densmap_1, y=densmap_2)) +
+  theme_minimal() +
+  #labs(title="t-SNE of Chemical Descriptors Colored by Sector Class") +
+  geom_point(data=tmp2[which(tmp2$seem_class=="No Exposure Prediction"),], aes(color="No Exposure Prediction"),alpha=0.1, size=0.8, shape=16)+
+  geom_point(data=tmp2[which(tmp2$seem_class=="SEEM Prediction"),], aes(color="SEEM Prediction"),alpha=0.3, size=0.8, shape=16) +
+  geom_point(data=tmp2[which(tmp2$seem_class=="Outside SEEM Applicability Domain"),], aes(color="Outside SEEM Applicability Domain"), alpha=0.4, size=0.6, shape=16) +
+   geom_point(data=tmp2[which(tmp2$seem_class=="Inferred from NHANES"),], aes(color="Inferred from NHANES"), alpha=0.7, size=1.5, shape=16) +
+  theme_minimal() +
+  scale_color_manual(values=typecolors) + xlab("DensMap Dimension 1")+ylab("DensMap Dimension 2")+
+  theme(legend.title = element_blank(),legend.position = "bottom",
+legend.text = element_text(size = 12), # legend labels
+axis.title.x = element_text(size = 16), # x-axis title
+axis.title.y = element_text(size = 16), # y-axis title
+axis.text.x = element_text(size = 12), # x-axis tick labels
+axis.text.y = element_text(size = 12))+ # y-axis tick labels) + 
+  ylim(-5,20)+xlim(-10,20)+ guides(color = guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+
+tmp3<-dplyr::select(tmp, densmap_1, densmap_2, cichem_id)
+
+tmp3$path_class<-"No Pathway"
+haspest<-deltas$cichem[which(deltas$delta.Pest.pred>0.5)]
+hasindustrial<-deltas$cichem[which(deltas$delta.Indust.pred>0.5)]
+hasconsumer<-deltas$cichem[which(deltas$delta.Res.pred>0.5)]
+hasdietary<-deltas$cichem[which(deltas$delta.Diet.pred>0.5)]
+
+tmp3$path_class[which(tmp3$cichem_id %in% haspest)]<-"Pesticide Pathway"
+tmp3$path_class[which(tmp3$cichem_id %in% hasindustrial)]<-"Industrial Pathway"
+tmp3$path_class[which(tmp3$cichem_id %in% hasconsumer)]<-"Consumer Pathway"
+tmp3$path_class[which(tmp3$cichem_id %in% hasdietary)]<-"Dietary Pathway"
+
+#if it has one or more pathways, set "Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% haspest & tmp3$cichem_id %in% hasindustrial)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% haspest & tmp3$cichem_id %in% hasconsumer)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% haspest & tmp3$cichem_id %in% hasdietary)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% hasindustrial & tmp3$cichem_id %in% hasconsumer)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% hasindustrial & tmp3$cichem_id %in% hasdietary)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% hasconsumer & tmp3$cichem_id %in% hasdietary)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% haspest & tmp3$cichem_id %in% hasindustrial & tmp3$cichem_id %in% hasconsumer)]<-"Multiple Pathways"
+tmp3$path_class[which(tmp3$cichem_id %in% haspest & tmp3$cichem_id %in% hasindustrial & tmp3$cichem_id %in% hasdietary)]<-"Multiple Pathways"
+
+tmp3 <- tmp3 %>%
+  mutate(path_class = factor(path_class, levels = c("No Pathway", "Multiple Pathways","Industrial Pathway","Consumer Pathway","Pesticide Pathway","Dietary Pathway"))) %>%
+  arrange(path_class)
+
+pathcolors<- c("No Pathway"="#BCBEC0", "Multiple Pathways"="#BCE4F7","Industrial Pathway"="#B38874","Consumer Pathway"="#0A32FF","Pesticide Pathway"="#CA0123","Dietary Pathway"="#00A451")
+
+library(ggh4x)
+seemplot<-ggplot(tmp3, aes(x=densmap_1, y=densmap_2, color=path_class)) +
+  geom_point(alpha=0.8) +
+  theme_minimal() +
+  #labs(title="t-SNE of Chemical Descriptors Colored by Sector Class") +
+  scale_color_manual(values=pathcolors) +
+  theme(legend.title = element_blank())+
+  facet_wrap(~path_class,scales = "free")
+
+seemplot<-seemplot +
+  facetted_pos_scales(
+    y = list(
+      path_class == "No Pathway" ~ scale_y_continuous(limits = c(-30, 30)),
+      path_class == "Multiple Pathways" ~ scale_y_continuous(limits = c(-10, 20)),
+      path_class == "Industrial Pathway" ~ scale_y_continuous(limits = c(-10, 20)),
+      path_class == "Consumer Pathway" ~ scale_y_continuous(limits = c(-10, 20)),
+      path_class == "Pesticide Pathway" ~ scale_y_continuous(limits = c(-10, 20)),
+      path_class == "Dietary Pathway" ~ scale_y_continuous(limits = c(-10, 20))   
+    ),
+    x = list(
+      path_class == "No Pathway" ~ scale_x_continuous(limits = c(-30, 30)),
+      path_class == "Multiple Pathways" ~ scale_x_continuous(limits = c(-10, 20)),
+      path_class == "Industrial Pathway" ~ scale_x_continuous(limits = c(-10, 20)),
+      path_class == "Consumer Pathway" ~ scale_x_continuous(limits = c(-10, 20)),
+      path_class == "Pesticide Pathway" ~ scale_x_continuous(limits = c(-10, 20)),
+      path_class == "Dietary Pathway" ~ scale_x_continuous(limits = c(-10, 20))      
+    )
+  )
+
+
+#make a barchart of the range of uncertainty bounds by sector
+
+
+list(seemplot, pathway_coverage,seemclass, ridge,seemunc)
+
+}
+
+k<-do_exposure_prediction_plot()
+
+ggsave(
+  filename = "Output/exposure_pathway_landscape.png",
+  plot = k[[1]],
+  width = 15,
+  height = 10,
+  dpi = 300
+)
+
+preview_file <- preview_png("Output/exposure_pathway_landscape.png",
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+
+ggsave(
+  filename = "Output/pathway_coverage.png",
+  plot = k[[2]],
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+preview_file <- preview_png("Output/pathway_coverage.png",
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+ggsave(
+  filename = "Output/seem_availability_landscape.png",
+  plot = k[[3]],
+  width = 15,
+  height = 10,
+  dpi = 300
+)
+preview_file <- preview_png("Output/seem_availability_landscape.png",
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+  ggsave(
+  filename = "Output/seem_ridge.png",
+  plot = k[[4]],
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+    preview_file <- preview_png("Output/seem_ridge.png",
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+
+  ggsave(
+  filename = "Output/seem_unc.png",
+  plot = k[[5]],
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+  
+preview_file <- preview_png("Output/seem_unc.png",
+  scale = 0.3
+)
+knitr::include_graphics(preview_file)
+
+```
+
+
