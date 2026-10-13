@@ -4,7 +4,7 @@ Wilson M, Sams RL, Edwards S, Thomas RS, and Paul Friedman K. Characterizing Exp
 Collection of Chemicals. 2026. Submitted to Environmental Sciences and Technology.
 
 Reproducible code is available in ROCKS_Exposure_analyses.rmd
-Rendered analysis and figure results (with accompanying code) is provided in ROCKS_Exposure_analyses.html
+Rendered analysis and figure results (with accompanying code) is provided in ROCKS_Exposure_analyses.html.
 
 Input datasets for this code are available here:
 
